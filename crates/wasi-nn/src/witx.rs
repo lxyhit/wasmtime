@@ -22,8 +22,6 @@ use std::hash::Hash;
 use thiserror::Error;
 use wiggle::{GuestError, GuestMemory, GuestPtr};
 
-pub use gen::wasi_ephemeral_nn::add_to_linker;
-
 pub(crate) type WasiNnResult<T> = std::result::Result<T, WasiNnError>;
 type Result<T> = WasiNnResult<T>;
 type GraphId = u32;
@@ -91,11 +89,12 @@ where
 }
 
 /// Generate the traits and types from the `wasi-nn` WITX specification.
-mod gen {
+pub mod gen {
     use super::*;
     wiggle::from_witx!({
         witx: ["$WASI_ROOT/wasi-nn.witx"],
-        errors: { nn_errno => WasiNnError }
+        errors: { nn_errno => WasiNnError },
+        wasmtime: false,
     });
 
     /// Additionally, we must let Wiggle know which of our error codes
