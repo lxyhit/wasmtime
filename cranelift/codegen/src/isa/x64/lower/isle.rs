@@ -22,8 +22,8 @@ use crate::{
         inst::{args::*, regs, ReturnCallInfo},
     },
     machinst::{
-        isle::*, ArgPair, CallInfo, InsnInput, InstOutput, IsTailCall, MachAtomicRmwOp, MachInst,
-        VCodeConstant, VCodeConstantData,
+        isle::*, ArgPair, CallInfo, InsnInput, InstOutput, IsTailCall, MachInst, VCodeConstant,
+        VCodeConstantData,
     },
 };
 use alloc::vec::Vec;
@@ -39,6 +39,7 @@ type BoxCallIndInfo = Box<CallInfo<RegMem>>;
 type BoxReturnCallInfo = Box<ReturnCallInfo<ExternalName>>;
 type BoxReturnCallIndInfo = Box<ReturnCallInfo<Reg>>;
 type VecArgPair = Vec<ArgPair>;
+type BoxSyntheticAmode = Box<SyntheticAmode>;
 
 pub struct SinkableLoad {
     inst: Inst,
@@ -72,63 +73,7 @@ pub(crate) fn lower_branch(
 
 impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     isle_lower_prelude_methods!();
-    isle_prelude_caller_methods!(X64ABIMachineSpec, X64CallSite);
-
-    fn gen_return_call_indirect(
-        &mut self,
-        callee_sig: SigRef,
-        callee: Value,
-        args: ValueSlice,
-    ) -> InstOutput {
-        let caller_conv = isa::CallConv::Tail;
-        debug_assert_eq!(
-            self.lower_ctx.abi().call_conv(self.lower_ctx.sigs()),
-            caller_conv,
-            "Can only do `return_call`s from within a `tail` calling convention function"
-        );
-
-        let callee = self.put_in_reg(callee);
-
-        let call_site = X64CallSite::from_ptr(
-            self.lower_ctx.sigs(),
-            callee_sig,
-            callee,
-            IsTailCall::Yes,
-            caller_conv,
-            self.backend.flags().clone(),
-        );
-        call_site.emit_return_call(self.lower_ctx, args);
-
-        InstOutput::new()
-    }
-
-    fn gen_return_call(
-        &mut self,
-        callee_sig: SigRef,
-        callee: ExternalName,
-        distance: RelocDistance,
-        args: ValueSlice,
-    ) -> InstOutput {
-        let caller_conv = isa::CallConv::Tail;
-        debug_assert_eq!(
-            self.lower_ctx.abi().call_conv(self.lower_ctx.sigs()),
-            caller_conv,
-            "Can only do `return_call`s from within a `tail` calling convention function"
-        );
-
-        let call_site = X64CallSite::from_func(
-            self.lower_ctx.sigs(),
-            callee_sig,
-            &callee,
-            IsTailCall::Yes,
-            distance,
-            caller_conv,
-            self.backend.flags().clone(),
-        );
-        call_site.emit_return_call(self.lower_ctx, args);
-
-        InstOutput::new()
-    }
+    isle_prelude_caller_methods!(X64CallSite);
 
     #[inline]
     fn operand_size_of_type_32_64(&mut self, ty: Type) -> OperandSize {
@@ -294,6 +239,11 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     #[inline]
     fn use_sse42(&mut self) -> bool {
         self.backend.x64_flags.use_sse42()
+    }
+
+    #[inline]
+    fn use_cmpxchg16b(&mut self) -> bool {
+        self.backend.x64_flags.use_cmpxchg16b()
     }
 
     #[inline]
@@ -666,11 +616,6 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     }
 
     #[inline]
-    fn atomic_rmw_op_to_mach_atomic_rmw_op(&mut self, op: &AtomicRmwOp) -> MachAtomicRmwOp {
-        MachAtomicRmwOp::from(*op)
-    }
-
-    #[inline]
     fn preg_rbp(&mut self) -> PReg {
         regs::rbp().to_real_reg().unwrap().into()
     }
@@ -989,6 +934,15 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     fn insert_i8x16_lane_hole(&mut self, hole_idx: u8) -> VCodeConstant {
         let mask = -1i128 as u128;
         self.emit_u128_le_const(mask ^ (0xff << (hole_idx * 8)))
+    }
+
+    fn writable_invalid_gpr(&mut self) -> WritableGpr {
+        let reg = Gpr::new(self.invalid_reg()).unwrap();
+        WritableGpr::from_reg(reg)
+    }
+
+    fn box_synthetic_amode(&mut self, amode: &SyntheticAmode) -> BoxSyntheticAmode {
+        Box::new(amode.clone())
     }
 }
 

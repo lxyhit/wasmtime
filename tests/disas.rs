@@ -45,7 +45,7 @@ use cranelift_codegen::ir::{Function, UserExternalName, UserFuncName};
 use cranelift_codegen::isa::{lookup_by_name, TargetIsa};
 use cranelift_codegen::settings::{Configurable, Flags, SetError};
 use libtest_mimic::{Arguments, Trial};
-use serde::de::DeserializeOwned;
+use pulley_interpreter::decode::OpVisitor;
 use serde_derive::Deserialize;
 use similar::TextDiff;
 use std::fmt::Write;
@@ -59,6 +59,8 @@ fn main() -> Result<()> {
     if cfg!(miri) {
         return Ok(());
     }
+
+    let _ = env_logger::try_init();
 
     let mut tests = Vec::new();
     find_tests("./tests/disas".as_ref(), &mut tests)?;
@@ -149,7 +151,7 @@ impl Test {
     fn new(path: &Path) -> Result<Test> {
         let contents =
             std::fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
-        let config: TestConfig = Test::parse_test_config(&contents)
+        let config: TestConfig = wasmtime_wast_util::parse_test_config(&contents)
             .context("failed to parse test configuration as TOML")?;
         let mut flags = vec!["wasmtime"];
         match &config.flags {
@@ -165,24 +167,6 @@ impl Test {
             opts,
             contents,
         })
-    }
-
-    /// Parse test configuration from the specified test, comments starting with
-    /// `;;!`.
-    fn parse_test_config<T>(wat: &str) -> Result<T>
-    where
-        T: DeserializeOwned,
-    {
-        // The test config source is the leading lines of the WAT file that are
-        // prefixed with `;;!`.
-        let config_lines: Vec<_> = wat
-            .lines()
-            .take_while(|l| l.starts_with(";;!"))
-            .map(|l| &l[3..])
-            .collect();
-        let config_text = config_lines.join("\n");
-
-        toml::from_str(&config_text).context("failed to parse the test configuration")
     }
 
     /// Generates CLIF for all the wasm functions in this test.
@@ -311,17 +295,130 @@ fn assert_output(
                 }
             }
         }
-        CompileOutput::Elf(bytes) => {
-            let disas = isa.to_capstone()?;
-            disas_elf(&disas, &mut actual, &bytes)?;
-        }
+        CompileOutput::Elf(bytes) => match isa.to_capstone() {
+            Ok(disas) => disas_insts(&mut actual, &bytes, |bytes, addr| {
+                Ok(disas
+                    .disasm_all(bytes, addr)?
+                    .into_iter()
+                    .map(|inst| {
+                        use capstone::InsnGroupType::{CS_GRP_JUMP, CS_GRP_RET};
+
+                        let detail = disas.insn_detail(&inst).ok();
+                        let detail = detail.as_ref();
+                        let is_jump = detail
+                            .map(|d| {
+                                d.groups()
+                                    .iter()
+                                    .find(|g| g.0 as u32 == CS_GRP_JUMP)
+                                    .is_some()
+                            })
+                            .unwrap_or(false);
+
+                        let is_return = detail
+                            .map(|d| {
+                                d.groups()
+                                    .iter()
+                                    .find(|g| g.0 as u32 == CS_GRP_RET)
+                                    .is_some()
+                            })
+                            .unwrap_or(false);
+
+                        let disassembly = match (inst.mnemonic(), inst.op_str()) {
+                            (Some(i), Some(o)) => {
+                                if o.is_empty() {
+                                    format!("{i}")
+                                } else {
+                                    format!("{i:7} {o}")
+                                }
+                            }
+                            (Some(i), None) => format!("{i}"),
+                            _ => unreachable!(),
+                        };
+
+                        let address = inst.address();
+                        DisasInst {
+                            address,
+                            is_jump,
+                            is_return,
+                            disassembly,
+                        }
+                    })
+                    .collect::<Vec<_>>())
+            })?,
+            Err(_) => {
+                assert!(matches!(
+                    isa.triple().architecture,
+                    target_lexicon::Architecture::Pulley32 | target_lexicon::Architecture::Pulley64
+                ));
+                disas_insts(&mut actual, &bytes, |bytes, _addr| {
+                    let mut result = vec![];
+
+                    let mut disas = pulley_interpreter::disas::Disassembler::new(bytes);
+                    disas.offsets(false);
+                    disas.hexdump(false);
+                    let mut decoder = pulley_interpreter::decode::Decoder::new();
+
+                    loop {
+                        let addr = disas.bytecode().position();
+
+                        match decoder.decode_one(&mut disas) {
+                            // If we got EOF at the initial position, then we're done disassembling.
+                            Err(pulley_interpreter::decode::DecodingError::UnexpectedEof {
+                                position,
+                            }) if position == addr => break,
+
+                            // Otherwise, propagate the error.
+                            Err(e) => {
+                                return Err(anyhow::Error::from(e))
+                                    .context("failed to disassembly pulley bytecode");
+                            }
+
+                            Ok(()) => {
+                                let disassembly = disas
+                                    .disas()
+                                    .lines()
+                                    .map(|l| l.trim().to_string())
+                                    .filter(|l| !l.is_empty())
+                                    .next_back()
+                                    .unwrap();
+                                let address = u64::try_from(addr).unwrap();
+                                let is_jump =
+                                    disassembly.contains("jump") || disassembly.contains("br_if");
+                                let is_return = disassembly == "ret";
+                                result.push(DisasInst {
+                                    address,
+                                    is_jump,
+                                    is_return,
+                                    disassembly,
+                                });
+                            }
+                        }
+                    }
+
+                    Ok(result)
+                })?
+            }
+        },
     }
     let actual = actual.trim();
     assert_or_bless_output(path, wat, actual)
 }
 
-fn disas_elf(disas: &capstone::Capstone, result: &mut String, elf: &[u8]) -> Result<()> {
-    use capstone::InsnGroupType::{CS_GRP_JUMP, CS_GRP_RET};
+struct DisasInst {
+    address: u64,
+    is_jump: bool,
+    is_return: bool,
+    disassembly: String,
+}
+
+fn disas_insts<I>(
+    result: &mut String,
+    elf: &[u8],
+    disas: impl Fn(&[u8], u64) -> Result<I>,
+) -> Result<()>
+where
+    I: IntoIterator<Item = DisasInst>,
+{
     use object::{Endianness, Object, ObjectSection, ObjectSymbol};
 
     let elf = object::read::elf::ElfFile64::<Endianness>::parse(elf)?;
@@ -354,50 +451,27 @@ fn disas_elf(disas: &capstone::Capstone, result: &mut String, elf: &[u8]) -> Res
         let mut prev_jump = false;
         let mut write_offsets = false;
 
-        for inst in disas.disasm_all(bytes, sym.address())?.iter() {
-            let detail = disas.insn_detail(&inst).ok();
-            let detail = detail.as_ref();
-            let is_jump = detail
-                .map(|d| {
-                    d.groups()
-                        .iter()
-                        .find(|g| g.0 as u32 == CS_GRP_JUMP)
-                        .is_some()
-                })
-                .unwrap_or(false);
-
+        for DisasInst {
+            address,
+            is_jump,
+            is_return,
+            disassembly: disas,
+        } in disas(bytes, sym.address())?.into_iter()
+        {
             if write_offsets || (prev_jump && !is_jump) {
-                write!(result, "{:>4x}: ", inst.address())?;
+                write!(result, "{address:>4x}: ")?;
             } else {
                 write!(result, "      ")?;
             }
 
-            match (inst.mnemonic(), inst.op_str()) {
-                (Some(i), Some(o)) => {
-                    if o.is_empty() {
-                        writeln!(result, "{i}")?;
-                    } else {
-                        writeln!(result, "{i:7} {o}")?;
-                    }
-                }
-                (Some(i), None) => writeln!(result, "{i}")?,
-                _ => unreachable!(),
-            }
+            writeln!(result, "{disas}")?;
 
             prev_jump = is_jump;
 
             // Flip write_offsets to true once we've seen a `ret`, as
             // instructions that follow the return are often related to trap
             // tables.
-            write_offsets = write_offsets
-                || detail
-                    .map(|d| {
-                        d.groups()
-                            .iter()
-                            .find(|g| g.0 as u32 == CS_GRP_RET)
-                            .is_some()
-                    })
-                    .unwrap_or(false);
+            write_offsets |= is_return;
         }
     }
     Ok(())

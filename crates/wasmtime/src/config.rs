@@ -1,17 +1,17 @@
+use crate::hash_map::HashMap;
+use crate::hash_set::HashSet;
 use crate::prelude::*;
 use alloc::sync::Arc;
 use bitflags::Flags;
 use core::fmt;
 use core::str::FromStr;
-use hashbrown::{HashMap, HashSet};
 use serde_derive::{Deserialize, Serialize};
 #[cfg(any(feature = "cache", feature = "cranelift", feature = "winch"))]
 use std::path::Path;
-use target_lexicon::Architecture;
 use wasmparser::WasmFeatures;
 #[cfg(feature = "cache")]
 use wasmtime_cache::CacheConfig;
-use wasmtime_environ::Tunables;
+use wasmtime_environ::{ConfigTunables, Tunables};
 
 #[cfg(feature = "runtime")]
 use crate::memory::MemoryCreator;
@@ -36,6 +36,7 @@ pub use wasmtime_environ::CacheStore;
 
 /// Represents the module instance allocation strategy to use.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum InstanceAllocationStrategy {
     /// The on-demand instance allocation strategy.
     ///
@@ -64,6 +65,13 @@ impl InstanceAllocationStrategy {
 impl Default for InstanceAllocationStrategy {
     fn default() -> Self {
         Self::OnDemand
+    }
+}
+
+#[cfg(feature = "pooling-allocator")]
+impl From<PoolingAllocationConfig> for InstanceAllocationStrategy {
+    fn from(cfg: PoolingAllocationConfig) -> InstanceAllocationStrategy {
+        InstanceAllocationStrategy::Pooling(cfg)
     }
 }
 
@@ -106,6 +114,8 @@ impl core::hash::Hash for ModuleVersionStrategy {
 pub struct Config {
     #[cfg(any(feature = "cranelift", feature = "winch"))]
     compiler_config: CompilerConfig,
+    #[cfg(feature = "gc")]
+    collector: Collector,
     profiling_strategy: ProfilingStrategy,
     tunables: ConfigTunables,
 
@@ -141,24 +151,6 @@ pub struct Config {
     pub(crate) coredump_on_trap: bool,
     pub(crate) macos_use_mach_ports: bool,
     pub(crate) detect_host_feature: Option<fn(&str) -> Option<bool>>,
-}
-
-#[derive(Default, Clone)]
-struct ConfigTunables {
-    static_memory_reservation: Option<u64>,
-    static_memory_offset_guard_size: Option<u64>,
-    dynamic_memory_offset_guard_size: Option<u64>,
-    dynamic_memory_growth_reserve: Option<u64>,
-    generate_native_debuginfo: Option<bool>,
-    parse_wasm_debuginfo: Option<bool>,
-    consume_fuel: Option<bool>,
-    epoch_interruption: Option<bool>,
-    static_memory_bound_is_maximum: Option<bool>,
-    guard_before_linear_memory: Option<bool>,
-    table_lazy_init: Option<bool>,
-    generate_address_map: Option<bool>,
-    debug_adapter_modules: Option<bool>,
-    relaxed_simd_deterministic: Option<bool>,
 }
 
 /// User-provided configuration for the compiler.
@@ -225,6 +217,8 @@ impl Config {
             tunables: ConfigTunables::default(),
             #[cfg(any(feature = "cranelift", feature = "winch"))]
             compiler_config: CompilerConfig::default(),
+            #[cfg(feature = "gc")]
+            collector: Collector::default(),
             #[cfg(feature = "cache")]
             cache_config: CacheConfig::new_cache_disabled(),
             profiling_strategy: ProfilingStrategy::None,
@@ -410,6 +404,7 @@ impl Config {
     /// guest WebAssembly programs.
     ///
     /// By default this option is `false`.
+    /// **Note** Enabling this option is not compatible with the Winch compiler.
     pub fn debug_info(&mut self, enable: bool) -> &mut Self {
         self.tunables.generate_native_debuginfo = Some(enable);
         self
@@ -513,6 +508,8 @@ impl Config {
     /// executing some code.
     ///
     /// By default this option is `false`.
+    ///
+    /// **Note** Enabling this option is not compatible with the Winch compiler.
     ///
     /// [`Store`]: crate::Store
     pub fn consume_fuel(&mut self, enable: bool) -> &mut Self {
@@ -619,6 +616,8 @@ impl Config {
     /// always either complete or trap with an out-of-fuel error,
     /// deterministically, then fuel with a fixed bound should be
     /// used.
+    ///
+    /// **Note** Enabling this option is not compatible with the Winch compiler.
     ///
     /// # See Also
     ///
@@ -816,6 +815,17 @@ impl Config {
         self
     }
 
+    /// Configures whether the [WebAssembly wide-arithmetic][proposal] will be
+    /// enabled for compilation.
+    ///
+    /// This feature is `false` by default.
+    ///
+    /// [proposal]: https://github.com/WebAssembly/wide-arithmetic
+    pub fn wasm_wide_arithmetic(&mut self, enable: bool) -> &mut Self {
+        self.wasm_feature(WasmFeatures::WIDE_ARITHMETIC, enable);
+        self
+    }
+
     /// Configures whether the [WebAssembly Garbage Collection
     /// proposal][proposal] will be enabled for compilation.
     ///
@@ -1000,7 +1010,7 @@ impl Config {
     /// type.
     ///
     /// This is part of the transition plan in
-    /// https://github.com/WebAssembly/component-model/issues/370.
+    /// <https://github.com/WebAssembly/component-model/issues/370>.
     #[cfg(feature = "component-model")]
     pub fn wasm_component_model_more_flags(&mut self, enable: bool) -> &mut Self {
         self.wasm_feature(WasmFeatures::COMPONENT_MODEL_MORE_FLAGS, enable);
@@ -1010,7 +1020,7 @@ impl Config {
     /// Configures whether components support more than one return value for functions.
     ///
     /// This is part of the transition plan in
-    /// https://github.com/WebAssembly/component-model/pull/368.
+    /// <https://github.com/WebAssembly/component-model/pull/368>.
     #[cfg(feature = "component-model")]
     pub fn wasm_component_model_multiple_returns(&mut self, enable: bool) -> &mut Self {
         self.wasm_feature(WasmFeatures::COMPONENT_MODEL_MULTIPLE_RETURNS, enable);
@@ -1027,6 +1037,19 @@ impl Config {
     #[cfg(any(feature = "cranelift", feature = "winch"))]
     pub fn strategy(&mut self, strategy: Strategy) -> &mut Self {
         self.compiler_config.strategy = strategy.not_auto();
+        self
+    }
+
+    /// Configures which garbage collector will be used for Wasm modules.
+    ///
+    /// This method can be used to configure which garbage collector
+    /// implementation is used for Wasm modules. For more documentation, consult
+    /// the [`Collector`] enumeration and its documentation.
+    ///
+    /// The default value for this is `Collector::Auto`.
+    #[cfg(feature = "gc")]
+    pub fn collector(&mut self, collector: Collector) -> &mut Self {
+        self.collector = collector;
         self
     }
 
@@ -1268,252 +1291,340 @@ impl Config {
 
     /// Sets the instance allocation strategy to use.
     ///
-    /// When using the pooling instance allocation strategy, all linear memories
-    /// will be created as "static" and the
-    /// [`Config::static_memory_maximum_size`] and
-    /// [`Config::static_memory_guard_size`] options will be used to configure
-    /// the virtual memory allocations of linear memories.
-    pub fn allocation_strategy(&mut self, strategy: InstanceAllocationStrategy) -> &mut Self {
-        self.allocation_strategy = strategy;
+    /// This is notably used in conjunction with
+    /// [`InstanceAllocationStrategy::Pooling`] and [`PoolingAllocationConfig`].
+    pub fn allocation_strategy(
+        &mut self,
+        strategy: impl Into<InstanceAllocationStrategy>,
+    ) -> &mut Self {
+        self.allocation_strategy = strategy.into();
         self
     }
 
-    /// Configures the maximum size, in bytes, where a linear memory is
-    /// considered static, above which it'll be considered dynamic.
+    /// Specifies the capacity of linear memories, in bytes, in their initial
+    /// allocation.
     ///
     /// > Note: this value has important performance ramifications, be sure to
-    /// > understand what this value does before tweaking it and benchmarking.
+    /// > benchmark when setting this to a non-default value and read over this
+    /// > documentation.
     ///
-    /// This function configures the threshold for wasm memories whether they're
-    /// implemented as a dynamically relocatable chunk of memory or a statically
-    /// located chunk of memory. The `max_size` parameter here is the size, in
-    /// bytes, where if the maximum size of a linear memory is below `max_size`
-    /// then it will be statically allocated with enough space to never have to
-    /// move. If the maximum size of a linear memory is larger than `max_size`
-    /// then wasm memory will be dynamically located and may move in memory
-    /// through growth operations.
+    /// This function will change the size of the initial memory allocation made
+    /// for linear memories. This setting is only applicable when the initial
+    /// size of a linear memory is below this threshold. Linear memories are
+    /// allocated in the virtual address space of the host process with OS APIs
+    /// such as `mmap` and this setting affects how large the allocation will
+    /// be.
     ///
-    /// Specifying a `max_size` of 0 means that all memories will be dynamic and
-    /// may be relocated through `memory.grow`. Also note that if any wasm
-    /// memory's maximum size is below `max_size` then it will still reserve
-    /// `max_size` bytes in the virtual memory space.
+    /// ## Background: WebAssembly Linear Memories
     ///
-    /// ## Static vs Dynamic Memory
+    /// WebAssembly linear memories always start with a minimum size and can
+    /// possibly grow up to a maximum size. The minimum size is always specified
+    /// in a WebAssembly module itself and the maximum size can either be
+    /// optionally specified in the module or inherently limited by the index
+    /// type. For example for this module:
     ///
-    /// Linear memories represent contiguous arrays of bytes, but they can also
-    /// be grown through the API and wasm instructions. When memory is grown if
-    /// space hasn't been preallocated then growth may involve relocating the
-    /// base pointer in memory. Memories in Wasmtime are classified in two
-    /// different ways:
+    /// ```wasm
+    /// (module
+    ///     (memory $a 4)
+    ///     (memory $b 4096 4096 (pagesize 1))
+    ///     (memory $c i64 10)
+    /// )
+    /// ```
     ///
-    /// * **static** - these memories preallocate all space necessary they'll
-    ///   ever need, meaning that the base pointer of these memories is never
-    ///   moved. Static memories may take more virtual memory space because of
-    ///   pre-reserving space for memories.
+    /// * Memory `$a` initially allocates 4 WebAssembly pages (256KiB) and can
+    ///   grow up to 4GiB, the limit of the 32-bit index space.
+    /// * Memory `$b` initially allocates 4096 WebAssembly pages, but in this
+    ///   case its page size is 1, so it's 4096 bytes. Memory can also grow no
+    ///   further meaning that it will always be 4096 bytes.
+    /// * Memory `$c` is a 64-bit linear memory which starts with 640KiB of
+    ///   memory and can theoretically grow up to 2^64 bytes, although most
+    ///   hosts will run out of memory long before that.
     ///
-    /// * **dynamic** - these memories are not preallocated and may move during
-    ///   growth operations. Dynamic memories consume less virtual memory space
-    ///   because they don't need to preallocate space for future growth.
+    /// All operations on linear memories done by wasm are required to be
+    /// in-bounds. Any access beyond the end of a linear memory is considered a
+    /// trap.
     ///
-    /// Static memories can be optimized better in JIT code because once the
-    /// base address is loaded in a function it's known that we never need to
-    /// reload it because it never changes, `memory.grow` is generally a pretty
-    /// fast operation because the wasm memory is never relocated, and under
-    /// some conditions bounds checks can be elided on memory accesses.
+    /// ## What this setting affects: Virtual Memory
     ///
-    /// Dynamic memories can't be quite as heavily optimized because the base
-    /// address may need to be reloaded more often, they may require relocating
-    /// lots of data on `memory.grow`, and dynamic memories require
-    /// unconditional bounds checks on all memory accesses.
+    /// This setting is used to configure the behavior of the size of the linear
+    /// memory allocation performed for each of these memories. For example the
+    /// initial linear memory allocation looks like this:
     ///
-    /// ## Should you use static or dynamic memory?
+    /// ```text
+    ///              memory_reservation
+    ///                    |
+    ///          ◄─────────┴────────────────►
+    /// ┌───────┬─────────┬──────────────────┬───────┐
+    /// │ guard │ initial │ ... capacity ... │ guard │
+    /// └───────┴─────────┴──────────────────┴───────┘
+    ///  ◄──┬──►                              ◄──┬──►
+    ///     │                                    │
+    ///     │                             memory_guard_size
+    ///     │
+    ///     │
+    ///  memory_guard_size (if guard_before_linear_memory)
+    /// ```
     ///
-    /// In general you probably don't need to change the value of this property.
-    /// The defaults here are optimized for each target platform to consume a
-    /// reasonable amount of physical memory while also generating speedy
-    /// machine code.
+    /// Memory in the `initial` range is accessible to the instance and can be
+    /// read/written by wasm code. Memory in the `guard` regions is never
+    /// accesible to wasm code and memory in `capacity` is initially
+    /// inaccessible but may become accesible through `memory.grow` instructions
+    /// for example.
     ///
-    /// One of the main reasons you may want to configure this today is if your
-    /// environment can't reserve virtual memory space for each wasm linear
-    /// memory. On 64-bit platforms wasm memories require a 6GB reservation by
-    /// default, and system limits may prevent this in some scenarios. In this
-    /// case you may wish to force memories to be allocated dynamically meaning
-    /// that the virtual memory footprint of creating a wasm memory should be
-    /// exactly what's used by the wasm itself.
+    /// This means that this setting is the size of the initial chunk of virtual
+    /// memory that a linear memory may grow into.
     ///
-    /// For 32-bit memories a static memory must contain at least 4GB of
-    /// reserved address space plus a guard page to elide any bounds checks at
-    /// all. Smaller static memories will use similar bounds checks as dynamic
-    /// memories.
+    /// ## What this setting affects: Runtime Speed
     ///
-    /// ## Default
+    /// This is a performance-sensitive setting which is taken into account
+    /// during the compilation process of a WebAssembly module. For example if a
+    /// 32-bit WebAssembly linear memory has a `memory_reservation` size of 4GiB
+    /// then bounds checks can be elided because `capacity` will be guaranteed
+    /// to be unmapped for all addressible bytes that wasm can access (modulo a
+    /// few details).
+    ///
+    /// If `memory_reservation` was something smaller like 256KiB then that
+    /// would have a much smaller impact on virtual memory but the compile code
+    /// would then need to have explicit bounds checks to ensure that
+    /// loads/stores are in-bounds.
+    ///
+    /// The goal of this setting is to enable skipping bounds checks in most
+    /// modules by default. Some situations which require explicit bounds checks
+    /// though are:
+    ///
+    /// * When `memory_reservation` is smaller than the addressible size of the
+    ///   linear memory. For example if 64-bit linear memories always need
+    ///   bounds checks as they can address the entire virtual address spacce.
+    ///   For 32-bit linear memories a `memory_reservation` minimum size of 4GiB
+    ///   is required to elide bounds checks.
+    ///
+    /// * When linear memories have a page size of 1 then bounds checks are
+    ///   required. In this situation virtual memory can't be relied upon
+    ///   because that operates at the host page size granularity where wasm
+    ///   requires a per-byte level granularity.
+    ///
+    /// * Configuration settings such as [`Config::signals_based_traps`] can be
+    ///   used to disable the use of signal handlers and virtual memory so
+    ///   explicit bounds checks are required.
+    ///
+    /// * When [`Config::memory_guard_size`] is too small a bounds check may be
+    ///   required. For 32-bit wasm addresses are actually 33-bit effective
+    ///   addresses because loads/stores have a 32-bit static offset to add to
+    ///   the dynamic 32-bit address. If the static offset is larger than the
+    ///   size of the guard region then an explicit bounds check is required.
+    ///
+    /// ## What this setting affects: Memory Growth Behavior
+    ///
+    /// In addition to affecting bounds checks emitted in compiled code this
+    /// setting also affects how WebAssembly linear memories are grown. The
+    /// `memory.grow` instruction can be used to make a linear memory larger and
+    /// this is also affected by APIs such as
+    /// [`Memory::grow`](crate::Memory::grow).
+    ///
+    /// In these situations when the amount being grown is small enough to fit
+    /// within the remaining capacity then the linear memory doesn't have to be
+    /// moved at runtime. If the capacity runs out though then a new linear
+    /// memory allocation must be made and the contents of linear memory is
+    /// copied over.
+    ///
+    /// For example here's a situation where a copy happens:
+    ///
+    /// * The `memory_reservation` setting is configured to 128KiB.
+    /// * A WebAssembly linear memory starts with a single 64KiB page.
+    /// * This memory can be grown by one page to contain the full 128KiB of
+    ///   memory.
+    /// * If grown by one more page, though, then a 192KiB allocation must be
+    ///   made and the previous 128KiB of contents are copied into the new
+    ///   allocation.
+    ///
+    /// This growth behavior can have a significant performance impact if lots
+    /// of data needs to be copied on growth. Conversely if memory growth never
+    /// needs to happen because the capacity will always be large enough then
+    /// optimizations can be applied to cache the base pointer of linear memory.
+    ///
+    /// When memory is grown then the
+    /// [`Config::memory_reservation_for_growth`] is used for the new
+    /// memory allocation to have memory to grow into.
+    ///
+    /// When using the pooling allocator via [`PoolingAllocationConfig`] then
+    /// memories are never allowed to move so requests for growth are instead
+    /// rejected with an error.
+    ///
+    /// ## When this setting is not used
+    ///
+    /// This setting is ignored and unused when the initial size of linear
+    /// memory is larger than this threshold. For example if this setting is set
+    /// to 1MiB but a wasm module requires a 2MiB minimum allocation then this
+    /// setting is ignored. In this situation the minimum size of memory will be
+    /// allocated along with [`Config::memory_reservation_for_growth`]
+    /// after it to grow into.
+    ///
+    /// That means that this value can be set to zero. That can be useful in
+    /// benchmarking to see the overhead of bounds checks for example.
+    /// Additionally it can be used to minimize the virtual memory allocated by
+    /// Wasmtime.
+    ///
+    /// ## Default Value
     ///
     /// The default value for this property depends on the host platform. For
     /// 64-bit platforms there's lots of address space available, so the default
-    /// configured here is 4GB. WebAssembly linear memories currently max out at
-    /// 4GB which means that on 64-bit platforms Wasmtime by default always uses
-    /// a static memory. This, coupled with a sufficiently sized guard region,
-    /// should produce the fastest JIT code on 64-bit platforms, but does
-    /// require a large address space reservation for each wasm memory.
+    /// configured here is 4GiB. When coupled with the default size of
+    /// [`Config::memory_guard_size`] this means that 32-bit WebAssembly linear
+    /// memories with 64KiB page sizes will skip almost all bounds checks by
+    /// default.
     ///
-    /// For 32-bit platforms this value defaults to 1GB. This means that wasm
-    /// memories whose maximum size is less than 1GB will be allocated
-    /// statically, otherwise they'll be considered dynamic.
-    ///
-    /// ## Static Memory and Pooled Instance Allocation
-    ///
-    /// When using the pooling instance allocator memories are considered to
-    /// always be static memories, they are never dynamic. This setting
-    /// configures the size of linear memory to reserve for each memory in the
-    /// pooling allocator.
-    ///
-    /// Note that the pooling allocator can reduce the amount of memory needed
-    /// for pooling allocation by using memory protection; see
-    /// `PoolingAllocatorConfig::memory_protection_keys` for details.
-    pub fn static_memory_maximum_size(&mut self, max_size: u64) -> &mut Self {
-        self.tunables.static_memory_reservation = Some(max_size);
+    /// For 32-bit platforms this value defaults to 10MiB. This means that
+    /// bounds checks will be required on 32-bit platforms.
+    pub fn memory_reservation(&mut self, bytes: u64) -> &mut Self {
+        self.tunables.memory_reservation = Some(bytes);
         self
     }
 
-    /// Indicates that the "static" style of memory should always be used.
+    /// Indicates whether linear memories may relocate their base pointer at
+    /// runtime.
     ///
-    /// This configuration option enables selecting the "static" option for all
-    /// linear memories created within this `Config`. This means that all
-    /// memories will be allocated up-front and will never move. Additionally
-    /// this means that all memories are synthetically limited by the
-    /// [`Config::static_memory_maximum_size`] option, regardless of what the
-    /// actual maximum size is on the memory's original type.
+    /// WebAssembly linear memories either have a maximum size that's explicitly
+    /// listed in the type of a memory or inherently limited by the index type
+    /// of the memory (e.g. 4GiB for 32-bit linear memories). Depending on how
+    /// the linear memory is allocated (see [`Config::memory_reservation`]) it
+    /// may be necessary to move the memory in the host's virtual address space
+    /// during growth. This option controls whether this movement is allowed or
+    /// not.
     ///
-    /// For the difference between static and dynamic memories, see the
-    /// [`Config::static_memory_maximum_size`].
-    pub fn static_memory_forced(&mut self, force: bool) -> &mut Self {
-        self.tunables.static_memory_bound_is_maximum = Some(force);
+    /// An example of a linear memory needing to move is when
+    /// [`Config::memory_reservation`] is 0 then a linear memory will be
+    /// allocated as the minimum size of the memory plus
+    /// [`Config::memory_reservation_for_growth`]. When memory grows beyond the
+    /// reservation for growth then the memory needs to be relocated.
+    ///
+    /// When this option is set to `false` then it can have a number of impacts
+    /// on how memories work at runtime:
+    ///
+    /// * Modules can be compiled with static knowledge the base pointer of
+    ///   linear memory never changes to enable optimizations such as
+    ///   loop invariant code motion (hoisting the base pointer out of a loop).
+    ///
+    /// * Memories cannot grow in excess of their original allocation. This
+    ///   means that [`Config::memory_reservation`] and
+    ///   [`Config::memory_reservation_for_growth`] may need tuning to ensure
+    ///   the memory configuration works at runtime.
+    ///
+    /// The default value for this option is `true`.
+    pub fn memory_may_move(&mut self, enable: bool) -> &mut Self {
+        self.tunables.memory_may_move = Some(enable);
         self
     }
 
     /// Configures the size, in bytes, of the guard region used at the end of a
-    /// static memory's address space reservation.
+    /// linear memory's address space reservation.
     ///
     /// > Note: this value has important performance ramifications, be sure to
     /// > understand what this value does before tweaking it and benchmarking.
     ///
-    /// All WebAssembly loads/stores are bounds-checked and generate a trap if
-    /// they're out-of-bounds. Loads and stores are often very performance
-    /// critical, so we want the bounds check to be as fast as possible!
-    /// Accelerating these memory accesses is the motivation for a guard after a
-    /// memory allocation.
+    /// This setting controls how many bytes are guaranteed to be unmapped after
+    /// the virtual memory allocation of a linear memory. When
+    /// combined with sufficiently large values of
+    /// [`Config::memory_reservation`] (e.g. 4GiB for 32-bit linear memories)
+    /// then a guard region can be used to eliminate bounds checks in generated
+    /// code.
     ///
-    /// Memories (both static and dynamic) can be configured with a guard at the
-    /// end of them which consists of unmapped virtual memory. This unmapped
-    /// memory will trigger a memory access violation (e.g. segfault) if
-    /// accessed. This allows JIT code to elide bounds checks if it can prove
-    /// that an access, if out of bounds, would hit the guard region. This means
-    /// that having such a guard of unmapped memory can remove the need for
-    /// bounds checks in JIT code.
-    ///
-    /// For the difference between static and dynamic memories, see the
-    /// [`Config::static_memory_maximum_size`].
+    /// This setting additionally can be used to help deduplicate bounds checks
+    /// in code that otherwise requires bounds checks. For example with a 4KiB
+    /// guard region then a 64-bit linear memory which accesses addresses `x+8`
+    /// and `x+16` only needs to perform a single bounds check on `x`. If that
+    /// bounds check passes then the offset is guaranteed to either reside in
+    /// linear memory or the guard region, resulting in deterministic behavior
+    /// either way.
     ///
     /// ## How big should the guard be?
     ///
-    /// In general, like with configuring `static_memory_maximum_size`, you
-    /// probably don't want to change this value from the defaults. Otherwise,
-    /// though, the size of the guard region affects the number of bounds checks
-    /// needed for generated wasm code. More specifically, loads/stores with
-    /// immediate offsets will generate bounds checks based on how big the guard
-    /// page is.
+    /// In general, like with configuring [`Config::memory_reservation`], you
+    /// probably don't want to change this value from the defaults. Removing
+    /// bounds checks is dependent on a number of factors where the size of the
+    /// guard region is only one piece of the equation. Other factors include:
     ///
-    /// For 32-bit wasm memories a 4GB static memory is required to even start
-    /// removing bounds checks. A 4GB guard size will guarantee that the module
-    /// has zero bounds checks for memory accesses. A 2GB guard size will
-    /// eliminate all bounds checks with an immediate offset less than 2GB. A
-    /// guard size of zero means that all memory accesses will still have bounds
-    /// checks.
+    /// * [`Config::memory_reservation`]
+    /// * The index type of the linear memory (e.g. 32-bit or 64-bit)
+    /// * The page size of the linear memory
+    /// * Other settings such as [`Config::signals_based_traps`]
+    ///
+    /// Embeddings using virtual memory almost always want at least some guard
+    /// region, but otherwise changes from the default should be profiled
+    /// locally to see the performance impact.
     ///
     /// ## Default
     ///
-    /// The default value for this property is 2GB on 64-bit platforms. This
+    /// The default value for this property is 2GiB on 64-bit platforms. This
     /// allows eliminating almost all bounds checks on loads/stores with an
-    /// immediate offset of less than 2GB. On 32-bit platforms this defaults to
-    /// 64KB.
-    ///
-    /// ## Errors
-    ///
-    /// The `Engine::new` method will return an error if this option is smaller
-    /// than the value configured for [`Config::dynamic_memory_guard_size`].
-    pub fn static_memory_guard_size(&mut self, guard_size: u64) -> &mut Self {
-        self.tunables.static_memory_offset_guard_size = Some(guard_size);
-        self
-    }
-
-    /// Configures the size, in bytes, of the guard region used at the end of a
-    /// dynamic memory's address space reservation.
-    ///
-    /// For the difference between static and dynamic memories, see the
-    /// [`Config::static_memory_maximum_size`]
-    ///
-    /// For more information about what a guard is, see the documentation on
-    /// [`Config::static_memory_guard_size`].
-    ///
-    /// Note that the size of the guard region for dynamic memories is not super
-    /// critical for performance. Making it reasonably-sized can improve
-    /// generated code slightly, but for maximum performance you'll want to lean
-    /// towards static memories rather than dynamic anyway.
-    ///
-    /// Also note that the dynamic memory guard size must be smaller than the
-    /// static memory guard size, so if a large dynamic memory guard is
-    /// specified then the static memory guard size will also be automatically
-    /// increased.
-    ///
-    /// ## Default
-    ///
-    /// This value defaults to 64KB.
-    ///
-    /// ## Errors
-    ///
-    /// The `Engine::new` method will return an error if this option is larger
-    /// than the value configured for [`Config::static_memory_guard_size`].
-    pub fn dynamic_memory_guard_size(&mut self, guard_size: u64) -> &mut Self {
-        self.tunables.dynamic_memory_offset_guard_size = Some(guard_size);
+    /// immediate offset of less than 2GiB. On 32-bit platforms this defaults to
+    /// 64KiB.
+    pub fn memory_guard_size(&mut self, bytes: u64) -> &mut Self {
+        self.tunables.memory_guard_size = Some(bytes);
         self
     }
 
     /// Configures the size, in bytes, of the extra virtual memory space
-    /// reserved after a "dynamic" memory for growing into.
+    /// reserved after a linear memory is relocated.
     ///
-    /// For the difference between static and dynamic memories, see the
-    /// [`Config::static_memory_maximum_size`]
+    /// This setting is used in conjunction with [`Config::memory_reservation`]
+    /// to configure what happens after a linear memory is relocated in the host
+    /// address space. If the initial size of a linear memory exceeds
+    /// [`Config::memory_reservation`] or if it grows beyond that size
+    /// throughout its lifetime then this setting will be used.
     ///
-    /// Dynamic memories can be relocated in the process's virtual address space
-    /// on growth and do not always reserve their entire space up-front. This
-    /// means that a growth of the memory may require movement in the address
-    /// space, which in the worst case can copy a large number of bytes from one
-    /// region to another.
+    /// When a linear memory is relocated it will initially look like this:
     ///
-    /// This setting configures how many bytes are reserved after the initial
-    /// reservation for a dynamic memory for growing into. A value of 0 here
-    /// means that no extra bytes are reserved and all calls to `memory.grow`
-    /// will need to relocate the wasm linear memory (copying all the bytes). A
-    /// value of 1 megabyte, however, means that `memory.grow` can allocate up
-    /// to a megabyte of extra memory before the memory needs to be moved in
-    /// linear memory.
+    /// ```text
+    ///            memory.size
+    ///                 │
+    ///          ◄──────┴─────►
+    /// ┌───────┬──────────────┬───────┐
+    /// │ guard │  accessible  │ guard │
+    /// └───────┴──────────────┴───────┘
+    ///                         ◄──┬──►
+    ///                            │
+    ///                     memory_guard_size
+    /// ```
+    ///
+    /// where `accessible` needs to be grown but there's no more memory to grow
+    /// into. A new region of the virtual address space will be allocated that
+    /// looks like this:
+    ///
+    /// ```text
+    ///                           memory_reservation_for_growth
+    ///                                       │
+    ///            memory.size                │
+    ///                 │                     │
+    ///          ◄──────┴─────► ◄─────────────┴───────────►
+    /// ┌───────┬──────────────┬───────────────────────────┬───────┐
+    /// │ guard │  accessible  │ .. reserved for growth .. │ guard │
+    /// └───────┴──────────────┴───────────────────────────┴───────┘
+    ///                                                     ◄──┬──►
+    ///                                                        │
+    ///                                               memory_guard_size
+    /// ```
+    ///
+    /// This means that up to `memory_reservation_for_growth` bytes can be
+    /// allocated again before the entire linear memory needs to be moved again
+    /// when another `memory_reservation_for_growth` bytes will be appended to
+    /// the size of the allocation.
     ///
     /// Note that this is a currently simple heuristic for optimizing the growth
     /// of dynamic memories, primarily implemented for the memory64 proposal
-    /// where all memories are currently "dynamic". This is unlikely to be a
-    /// one-size-fits-all style approach and if you're an embedder running into
-    /// issues with dynamic memories and growth and are interested in having
+    /// where the maximum size of memory is larger than 4GiB. This setting is
+    /// unlikely to be a one-size-fits-all style approach and if you're an
+    /// embedder running into issues with growth and are interested in having
     /// other growth strategies available here please feel free to [open an
     /// issue on the Wasmtime repository][issue]!
     ///
-    /// [issue]: https://github.com/bytecodealliance/wasmtime/issues/ne
+    /// [issue]: https://github.com/bytecodealliance/wasmtime/issues/new
     ///
     /// ## Default
     ///
-    /// For 64-bit platforms this defaults to 2GB, and for 32-bit platforms this
-    /// defaults to 1MB.
-    pub fn dynamic_memory_reserved_for_growth(&mut self, reserved: u64) -> &mut Self {
-        self.tunables.dynamic_memory_growth_reserve = Some(reserved);
+    /// For 64-bit platforms this defaults to 2GiB, and for 32-bit platforms
+    /// this defaults to 1MiB.
+    pub fn memory_reservation_for_growth(&mut self, bytes: u64) -> &mut Self {
+        self.tunables.memory_reservation_for_growth = Some(bytes);
         self
     }
 
@@ -1531,14 +1642,13 @@ impl Config {
     ///
     /// The size of the guard region before linear memory is the same as the
     /// guard size that comes after linear memory, which is configured by
-    /// [`Config::static_memory_guard_size`] and
-    /// [`Config::dynamic_memory_guard_size`].
+    /// [`Config::memory_guard_size`].
     ///
     /// ## Default
     ///
     /// This value defaults to `true`.
-    pub fn guard_before_linear_memory(&mut self, guard: bool) -> &mut Self {
-        self.tunables.guard_before_linear_memory = Some(guard);
+    pub fn guard_before_linear_memory(&mut self, enable: bool) -> &mut Self {
+        self.tunables.guard_before_linear_memory = Some(enable);
         self
     }
 
@@ -1546,6 +1656,8 @@ impl Config {
     /// is fast but indirect calls are a little slower. If false, tables
     /// are initialized eagerly during instantiation from any active element
     /// segments that apply to them.
+    ///
+    /// **Note** Disabling this option is not compatible with the Winch compiler.
     ///
     /// ## Default
     ///
@@ -1805,15 +1917,21 @@ impl Config {
     fn features(&self) -> WasmFeatures {
         // Wasmtime by default supports all of the wasm 2.0 version of the
         // specification.
-        let mut features = WasmFeatures::wasm2();
+        let mut features = WasmFeatures::WASM2;
 
         // On-by-default features that wasmtime has. Note that these are all
         // subject to the criteria at
         // https://docs.wasmtime.dev/contributing-implementing-wasm-proposals.html
+        // and
+        // https://docs.wasmtime.dev/stability-wasm-proposals.html
         features |= WasmFeatures::MULTI_MEMORY;
         features |= WasmFeatures::RELAXED_SIMD;
         features |= WasmFeatures::TAIL_CALL;
         features |= WasmFeatures::EXTENDED_CONST;
+        // NB: if you add a feature above this line please double-check
+        // https://docs.wasmtime.dev/stability-wasm-proposals.html
+        // to ensure all requirements are met and/or update the documentation
+        // there too.
 
         // Set some features to their conditionally-enabled defaults depending
         // on crate compile-time features.
@@ -1916,50 +2034,29 @@ impl Config {
             None => Tunables::default_host(),
         };
 
-        macro_rules! set_fields {
-            ($($field:ident)*) => (
-                let ConfigTunables {
-                    $($field,)*
-                } = &self.tunables;
-
-                $(
-                    if let Some(e) = $field {
-                        tunables.$field = *e;
-                    }
-                )*
-            )
-        }
-
-        set_fields! {
-            static_memory_reservation
-            static_memory_offset_guard_size
-            dynamic_memory_offset_guard_size
-            dynamic_memory_growth_reserve
-            generate_native_debuginfo
-            parse_wasm_debuginfo
-            consume_fuel
-            epoch_interruption
-            static_memory_bound_is_maximum
-            guard_before_linear_memory
-            table_lazy_init
-            generate_address_map
-            debug_adapter_modules
-            relaxed_simd_deterministic
-        }
+        self.tunables.configure(&mut tunables);
 
         // If we're going to compile with winch, we must use the winch calling convention.
         #[cfg(any(feature = "cranelift", feature = "winch"))]
         {
             tunables.winch_callable = self.compiler_config.strategy == Some(Strategy::Winch);
+        }
 
-            if tunables.winch_callable && !tunables.table_lazy_init {
-                bail!("Winch requires the table-lazy-init configuration option");
+        tunables.collector = if features.gc_types() {
+            #[cfg(feature = "gc")]
+            {
+                use wasmtime_environ::Collector as EnvCollector;
+                Some(match self.collector.try_not_auto()? {
+                    Collector::DeferredReferenceCounting => EnvCollector::DeferredReferenceCounting,
+                    Collector::Null => EnvCollector::Null,
+                    Collector::Auto => unreachable!(),
+                })
             }
-        }
-
-        if tunables.static_memory_offset_guard_size < tunables.dynamic_memory_offset_guard_size {
-            bail!("static memory guard size cannot be smaller than dynamic memory guard size");
-        }
+            #[cfg(not(feature = "gc"))]
+            bail!("cannot use GC types: the `gc` feature was disabled at compile time")
+        } else {
+            None
+        };
 
         Ok((tunables, features))
     }
@@ -2002,8 +2099,38 @@ impl Config {
     }
 
     #[cfg(feature = "runtime")]
-    pub(crate) fn build_gc_runtime(&self) -> Result<Arc<dyn GcRuntime>> {
-        Ok(Arc::new(crate::runtime::vm::default_gc_runtime()) as Arc<dyn GcRuntime>)
+    pub(crate) fn build_gc_runtime(&self) -> Result<Option<Arc<dyn GcRuntime>>> {
+        if !self.features().gc_types() {
+            return Ok(None);
+        }
+
+        #[cfg(not(feature = "gc"))]
+        bail!("cannot create a GC runtime: the `gc` feature was disabled at compile time");
+
+        #[cfg(feature = "gc")]
+        #[cfg_attr(
+            not(any(feature = "gc-null", feature = "gc-drc")),
+            allow(unused_variables, unreachable_code)
+        )]
+        {
+            Ok(Some(match self.collector.try_not_auto()? {
+                #[cfg(feature = "gc-drc")]
+                Collector::DeferredReferenceCounting => {
+                    Arc::new(crate::runtime::vm::DrcCollector::default()) as Arc<dyn GcRuntime>
+                }
+                #[cfg(not(feature = "gc-drc"))]
+                Collector::DeferredReferenceCounting => unreachable!(),
+
+                #[cfg(feature = "gc-null")]
+                Collector::Null => {
+                    Arc::new(crate::runtime::vm::NullCollector::default()) as Arc<dyn GcRuntime>
+                }
+                #[cfg(not(feature = "gc-null"))]
+                Collector::Null => unreachable!(),
+
+                Collector::Auto => unreachable!(),
+            }))
+        }
     }
 
     #[cfg(feature = "runtime")]
@@ -2050,16 +2177,20 @@ impl Config {
 
         let target = self.compiler_target();
 
-        // On supported targets, we enable stack probing by default.
+        // We enable stack probing by default on all targets.
         // This is required on Windows because of the way Windows
         // commits its stacks, but it's also a good idea on other
         // platforms to ensure guard pages are hit for large frame
         // sizes.
-        if probestack_supported(target.architecture) {
-            self.compiler_config
-                .flags
-                .insert("enable_probestack".into());
-        }
+        self.compiler_config
+            .flags
+            .insert("enable_probestack".into());
+
+        // The current wasm multivalue implementation depends on this.
+        // FIXME(#9510) handle this in wasmtime-cranelift instead.
+        self.compiler_config
+            .flags
+            .insert("enable_multi_ret_implicit_sret".into());
 
         if let Some(unwind_requested) = self.native_unwind_info {
             if !self
@@ -2085,6 +2216,29 @@ impl Config {
         self.compiler_config
             .settings
             .insert("preserve_frame_pointers".into(), "true".into());
+
+        if !tunables.signals_based_traps {
+            let mut ok = self.compiler_config.ensure_setting_unset_or_given(
+                "enable_table_access_spectre_mitigation".into(),
+                "false".into(),
+            );
+            ok = ok
+                && self.compiler_config.ensure_setting_unset_or_given(
+                    "enable_heap_access_spectre_mitigation".into(),
+                    "false".into(),
+                );
+
+            // Right now spectre-mitigated bounds checks will load from zero so
+            // if host-based signal handlers are disabled then that's a mismatch
+            // and doesn't work right now. Fixing this will require more thought
+            // of how to implement the bounds check in spectre-only mode.
+            if !ok {
+                bail!(
+                    "when signals-based traps are disabled then spectre \
+                     mitigations must also be disabled"
+                );
+            }
+        }
 
         // check for incompatible compiler options and set required values
         if features.contains(WasmFeatures::REFERENCE_TYPES) {
@@ -2203,6 +2357,45 @@ impl Config {
         self.detect_host_feature = Some(detect);
         self
     }
+
+    /// Configures Wasmtime to not use signals-based trap handlers, for example
+    /// disables `SIGILL` and `SIGSEGV` handler registration on Unix platforms.
+    ///
+    /// Wasmtime will by default leverage signals-based trap handlers (or the
+    /// platform equivalent, for example "vectored exception handlers" on
+    /// Windows) to make generated code more efficient. For example an
+    /// out-of-bounds load in WebAssembly will result in a `SIGSEGV` on Unix
+    /// that is caught by a signal handler in Wasmtime by default. Another
+    /// example is divide-by-zero is reported by hardware rather than
+    /// explicitly checked and Wasmtime turns that into a trap.
+    ///
+    /// Some environments however may not have easy access to signal handlers.
+    /// For example embedded scenarios may not support virtual memory. Other
+    /// environments where Wasmtime is embedded within the surrounding
+    /// environment may require that new signal handlers aren't registered due
+    /// to the global nature of signal handlers. This option exists to disable
+    /// the signal handler registration when required.
+    ///
+    /// When signals-based trap handlers are disabled then generated code will
+    /// never rely on segfaults or other signals. Generated code will be slower
+    /// because bounds checks must be explicit along with other operations like
+    /// integer division which must check for zero.
+    ///
+    /// When this option is disable it additionally requires that the
+    /// `enable_heap_access_spectre_mitigation` and
+    /// `enable_table_access_spectre_mitigation` Cranelift settings are
+    /// disabled. This means that generated code must have spectre mitigations
+    /// disabled. This is because spectre mitigations rely on faults from
+    /// loading from the null address to implement bounds checks.
+    ///
+    /// This option defaults to `true` meaning that signals-based trap handlers
+    /// are enabled by default.
+    ///
+    /// **Note** Disabling this option is not compatible with the Winch compiler.
+    pub fn signals_based_traps(&mut self, enable: bool) -> &mut Self {
+        self.tunables.signals_based_traps = Some(enable);
+        self
+    }
 }
 
 impl Default for Config {
@@ -2214,7 +2407,6 @@ impl Default for Config {
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let mut f = f.debug_struct("Config");
-        f.field("debug_info", &self.tunables.generate_native_debuginfo);
 
         // Not every flag in WasmFeatures can be enabled as part of creating
         // a Config. This impl gives a complete picture of all WasmFeatures
@@ -2235,21 +2427,7 @@ impl fmt::Debug for Config {
             f.field("compiler_config", &self.compiler_config);
         }
 
-        if let Some(enable) = self.tunables.parse_wasm_debuginfo {
-            f.field("parse_wasm_debuginfo", &enable);
-        }
-        if let Some(size) = self.tunables.static_memory_reservation {
-            f.field("static_memory_maximum_reservation", &size);
-        }
-        if let Some(size) = self.tunables.static_memory_offset_guard_size {
-            f.field("static_memory_guard_size", &size);
-        }
-        if let Some(size) = self.tunables.dynamic_memory_offset_guard_size {
-            f.field("dynamic_memory_guard_size", &size);
-        }
-        if let Some(enable) = self.tunables.guard_before_linear_memory {
-            f.field("guard_before_linear_memory", &enable);
-        }
+        self.tunables.format(&mut f);
         f.finish()
     }
 }
@@ -2293,6 +2471,135 @@ impl Strategy {
                 }
             }
             other => Some(*other),
+        }
+    }
+}
+
+/// Possible garbage collector implementations for Wasm.
+///
+/// This is used as an argument to the [`Config::collector`] method.
+///
+/// The properties of Wasmtime's available collectors are summarized in the
+/// following table:
+///
+/// | Collector                   | Collects Garbage[^1] | Latency[^2] | Throughput[^3] | Allocation Speed[^4] | Heap Utilization[^5] |
+/// |-----------------------------|----------------------|-------------|----------------|----------------------|----------------------|
+/// | `DeferredReferenceCounting` | Yes, but not cycles  | 🙂         | 🙁             | 😐                   | 😐                  |
+/// | `Null`                      | No                   | 🙂         | 🙂             | 🙂                   | 🙂                  |
+///
+/// [^1]: Whether or not the collector is capable of collecting garbage and cyclic garbage.
+///
+/// [^2]: How long the Wasm program is paused during garbage
+///       collections. Shorter is better. In general, better latency implies
+///       worse throughput and vice versa.
+///
+/// [^3]: How fast the Wasm program runs when using this collector. Roughly
+///       equivalent to the number of Wasm instructions executed per
+///       second. Faster is better. In general, better throughput implies worse
+///       latency and vice versa.
+///
+/// [^4]: How fast can individual objects be allocated?
+///
+/// [^5]: How many objects can the collector fit into N bytes of memory? That
+///       is, how much space for bookkeeping and metadata does this collector
+///       require? Less space taken up by metadata means more space for
+///       additional objects. Reference counts are larger than mark bits and
+///       free lists are larger than bump pointers, for example.
+#[non_exhaustive]
+#[derive(PartialEq, Eq, Clone, Debug, Copy)]
+pub enum Collector {
+    /// An indicator that the garbage collector should be automatically
+    /// selected.
+    ///
+    /// This is generally what you want for most projects and indicates that the
+    /// `wasmtime` crate itself should make the decision about what the best
+    /// collector for a wasm module is.
+    ///
+    /// Currently this always defaults to the deferred reference-counting
+    /// collector, but the default value may change over time.
+    Auto,
+
+    /// The deferred reference-counting collector.
+    ///
+    /// A reference-counting collector, generally trading improved latency for
+    /// worsened throughput. However, to avoid the largest overheads of
+    /// reference counting, it avoids manipulating reference counts for Wasm
+    /// objects on the stack. Instead, it will hold a reference count for an
+    /// over-approximation of all objects that are currently on the stack, trace
+    /// the stack during collection to find the precise set of on-stack roots,
+    /// and decrement the reference count of any object that was in the
+    /// over-approximation but not the precise set. This improves throughtput,
+    /// compared to "pure" reference counting, by performing many fewer
+    /// refcount-increment and -decrement operations. The cost is the increased
+    /// latency associated with tracing the stack.
+    ///
+    /// This collector cannot currently collect cycles; they will leak until the
+    /// GC heap's store is dropped.
+    DeferredReferenceCounting,
+
+    /// The null collector.
+    ///
+    /// This collector does not actually collect any garbage. It simply
+    /// allocates objects until it runs out of memory, at which point further
+    /// objects allocation attempts will trap.
+    ///
+    /// This collector is useful for incredibly short-running Wasm instances
+    /// where additionally you would rather halt an over-allocating Wasm program
+    /// than spend time collecting its garbage to allow it to keep running. It
+    /// is also useful for measuring the overheads associated with other
+    /// collectors, as this collector imposes as close to zero throughput and
+    /// latency overhead as possible.
+    Null,
+}
+
+impl Default for Collector {
+    fn default() -> Collector {
+        Collector::Auto
+    }
+}
+
+impl Collector {
+    fn not_auto(&self) -> Option<Collector> {
+        match self {
+            Collector::Auto => {
+                if cfg!(feature = "gc-drc") {
+                    Some(Collector::DeferredReferenceCounting)
+                } else if cfg!(feature = "gc-null") {
+                    Some(Collector::Null)
+                } else {
+                    None
+                }
+            }
+            other => Some(*other),
+        }
+    }
+
+    fn try_not_auto(&self) -> Result<Self> {
+        match self.not_auto() {
+            #[cfg(feature = "gc-drc")]
+            Some(c @ Collector::DeferredReferenceCounting) => Ok(c),
+            #[cfg(not(feature = "gc-drc"))]
+            Some(Collector::DeferredReferenceCounting) => bail!(
+                "cannot create an engine using the deferred reference-counting \
+                 collector because the `gc-drc` feature was not enabled at \
+                 compile time",
+            ),
+
+            #[cfg(feature = "gc-null")]
+            Some(c @ Collector::Null) => Ok(c),
+            #[cfg(not(feature = "gc-null"))]
+            Some(Collector::Null) => bail!(
+                "cannot create an engine using the null collector because \
+                 the `gc-null` feature was not enabled at compile time",
+            ),
+
+            Some(Collector::Auto) => unreachable!(),
+
+            None => bail!(
+                "cannot create an engine with GC support when none of the \
+                 collectors are available; enable one of the following \
+                 features: `gc-drc`, `gc-null`",
+            ),
         }
     }
 }
@@ -2379,16 +2686,17 @@ pub enum WasmBacktraceDetails {
 ///
 /// Another benefit of pooled allocation is that it's possible to configure
 /// things such that no virtual memory management is required at all in a steady
-/// state. For example a pooling allocator can be configured with
-/// [`Config::memory_init_cow`] disabledd, dynamic bounds checks enabled
-/// through
-/// [`Config::static_memory_maximum_size(0)`](Config::static_memory_maximum_size),
-/// and sufficient space through
-/// [`PoolingAllocationConfig::table_keep_resident`] /
-/// [`PoolingAllocationConfig::linear_memory_keep_resident`]. With all these
-/// options in place no virtual memory tricks are used at all and everything is
-/// manually managed by Wasmtime (for example resetting memory is a
-/// `memset(0)`). This is not as fast in a single-threaded scenario but can
+/// state. For example a pooling allocator can be configured with:
+///
+/// * [`Config::memory_init_cow`] disabled
+/// * [`Config::memory_guard_size`] disabled
+/// * [`Config::memory_reservation`] shrunk to minimal size
+/// * [`PoolingAllocationConfig::table_keep_resident`] sufficiently large
+/// * [`PoolingAllocationConfig::linear_memory_keep_resident`] sufficiently large
+///
+/// With all these options in place no virtual memory tricks are used at all and
+/// everything is manually managed by Wasmtime (for example resetting memory is
+/// a `memset(0)`). This is not as fast in a single-threaded scenario but can
 /// provide benefits in high-parallelism situations as no virtual memory locks
 /// or IPIs need happen.
 ///
@@ -2442,6 +2750,12 @@ pub struct PoolingAllocationConfig {
 
 #[cfg(feature = "pooling-allocator")]
 impl PoolingAllocationConfig {
+    /// Returns a new configuration builder with all default settings
+    /// configured.
+    pub fn new() -> PoolingAllocationConfig {
+        PoolingAllocationConfig::default()
+    }
+
     /// Configures the maximum number of "unused warm slots" to retain in the
     /// pooling allocator.
     ///
@@ -2638,7 +2952,7 @@ impl PoolingAllocationConfig {
     }
 
     /// The maximum number of core instances a single component may contain
-    /// (default is `20`).
+    /// (default is unlimited).
     ///
     /// This method (along with
     /// [`PoolingAllocationConfig::max_memories_per_component`],
@@ -2654,7 +2968,7 @@ impl PoolingAllocationConfig {
     }
 
     /// The maximum number of Wasm linear memories that a single component may
-    /// transitively contain (default is `20`).
+    /// transitively contain (default is unlimited).
     ///
     /// This method (along with
     /// [`PoolingAllocationConfig::max_core_instances_per_component`],
@@ -2670,7 +2984,7 @@ impl PoolingAllocationConfig {
     }
 
     /// The maximum number of tables that a single component may transitively
-    /// contain (default is `20`).
+    /// contain (default is unlimited).
     ///
     /// This method (along with
     /// [`PoolingAllocationConfig::max_core_instances_per_component`],
@@ -2813,7 +3127,7 @@ impl PoolingAllocationConfig {
     /// table; table elements are pointer-sized in the Wasmtime runtime.
     /// Therefore, the space reserved for each instance is `tables *
     /// table_elements * sizeof::<*const ()>`.
-    pub fn table_elements(&mut self, elements: u32) -> &mut Self {
+    pub fn table_elements(&mut self, elements: usize) -> &mut Self {
         self.config.limits.table_elements = elements;
         self
     }
@@ -2853,8 +3167,8 @@ impl PoolingAllocationConfig {
     /// [`memory_protection_keys`](PoolingAllocationConfig::memory_protection_keys).
     ///
     /// The virtual memory reservation size of each linear memory is controlled
-    /// by the [`Config::static_memory_maximum_size`] setting and this method's
-    /// configuration cannot exceed [`Config::static_memory_maximum_size`].
+    /// by the [`Config::memory_reservation`] setting and this method's
+    /// configuration cannot exceed [`Config::memory_reservation`].
     pub fn max_memory_size(&mut self, bytes: usize) -> &mut Self {
         self.config.limits.max_memory_size = bytes;
         self
@@ -2943,13 +3257,6 @@ impl PoolingAllocationConfig {
     }
 }
 
-pub(crate) fn probestack_supported(arch: Architecture) -> bool {
-    matches!(
-        arch,
-        Architecture::X86_64 | Architecture::Aarch64(_) | Architecture::Riscv64(_)
-    )
-}
-
 #[cfg(feature = "std")]
 fn detect_host_feature(feature: &str) -> Option<bool> {
     #[cfg(target_arch = "aarch64")]
@@ -2992,6 +3299,7 @@ fn detect_host_feature(feature: &str) -> Option<bool> {
     #[cfg(target_arch = "x86_64")]
     {
         return match feature {
+            "cmpxchg16b" => Some(std::is_x86_feature_detected!("cmpxchg16b")),
             "sse3" => Some(std::is_x86_feature_detected!("sse3")),
             "ssse3" => Some(std::is_x86_feature_detected!("ssse3")),
             "sse4.1" => Some(std::is_x86_feature_detected!("sse4.1")),

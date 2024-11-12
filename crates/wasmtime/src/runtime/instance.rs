@@ -258,7 +258,9 @@ impl Instance {
         store.bump_resource_counts(module)?;
 
         // Allocate the GC heap, if necessary.
-        let _ = store.gc_store_mut()?;
+        if store.engine().features().gc_types() {
+            let _ = store.gc_store_mut()?;
+        }
 
         let compiled_module = module.compiled_module();
 
@@ -289,6 +291,7 @@ impl Instance {
                     store: StorePtr::new(store.traitobj()),
                     wmemcheck: store.engine().config().wmemcheck,
                     pkey: store.get_pkey(),
+                    tunables: store.engine().tunables(),
                 })?;
 
         // The instance still has lots of setup, for example
@@ -337,13 +340,11 @@ impl Instance {
         // items from this instance into other instances should be ok when
         // those items are loaded and run we'll have all the metadata to
         // look at them.
-        instance_handle.initialize(
-            compiled_module.module(),
-            store
-                .engine()
-                .features()
-                .contains(WasmFeatures::BULK_MEMORY),
-        )?;
+        let bulk_memory = store
+            .engine()
+            .features()
+            .contains(WasmFeatures::BULK_MEMORY);
+        instance_handle.initialize(store, compiled_module.module(), bulk_memory)?;
 
         Ok((instance, compiled_module.module().start_func))
     }

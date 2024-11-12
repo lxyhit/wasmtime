@@ -6,6 +6,10 @@ inputs:
     description: 'Default toolchan to install'
     required: false
     default: 'default'
+  msrv_range:
+    description: 'Versions later-than-latest-Rust the MSRV supports'
+    required: false
+    default: '2'
 
 runs:
   using: composite
@@ -17,13 +21,14 @@ runs:
         # Determine MSRV as N in `1.N.0` by looking at the `rust-version`
         # located in the root `Cargo.toml`.
         msrv=$(grep 'rust-version.*1' Cargo.toml | sed 's/.*\.\([0-9]*\)\..*/\1/')
+        range=${{ inputs.msrv_range }}
 
         if [ "${{ inputs.toolchain }}" = "default" ]; then
-          echo "version=1.$((msrv+2)).0" >> "$GITHUB_OUTPUT"
+          echo "version=1.$((msrv+range)).0" >> "$GITHUB_OUTPUT"
         elif [ "${{ inputs.toolchain }}" = "msrv" ]; then
           echo "version=1.$msrv.0" >> "$GITHUB_OUTPUT"
         elif [ "${{ inputs.toolchain }}" = "wasmtime-ci-pinned-nightly" ]; then
-          echo "version=nightly-2024-09-05" >> "$GITHUB_OUTPUT"
+          echo "version=nightly-2024-10-22" >> "$GITHUB_OUTPUT"
         else
           echo "version=${{ inputs.toolchain }}" >> "$GITHUB_OUTPUT"
         fi

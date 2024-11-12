@@ -29,7 +29,8 @@ fn bad_tables() {
     let ty = TableType::new(RefType::FUNCREF, 0, Some(1));
     let t = Table::new(&mut store, ty.clone(), Ref::Func(None)).unwrap();
     assert!(t.get(&mut store, 0).is_none());
-    assert!(t.get(&mut store, u32::max_value()).is_none());
+    assert!(t.get(&mut store, u64::from(u32::MAX)).is_none());
+    assert!(t.get(&mut store, u64::MAX).is_none());
 
     // set out of bounds or wrong type
     let ty = TableType::new(RefType::FUNCREF, 1, Some(1));
@@ -164,8 +165,17 @@ fn get_set_externref_globals_via_api() -> anyhow::Result<()> {
     let hello = ExternRef::new(&mut store, "hello".to_string())?;
     global.set(&mut store, hello.into())?;
     let r = global.get(&mut store).unwrap_externref().cloned().unwrap();
-    assert!(r.data(&store)?.is::<String>());
-    assert_eq!(r.data(&store)?.downcast_ref::<String>().unwrap(), "hello");
+    assert!(r
+        .data(&store)?
+        .expect("should have host data")
+        .is::<String>());
+    assert_eq!(
+        r.data(&store)?
+            .expect("should have host data")
+            .downcast_ref::<String>()
+            .unwrap(),
+        "hello"
+    );
 
     // Initialize with a non-null externref.
 
@@ -176,8 +186,15 @@ fn get_set_externref_globals_via_api() -> anyhow::Result<()> {
         externref.into(),
     )?;
     let r = global.get(&mut store).unwrap_externref().cloned().unwrap();
-    assert!(r.data(&store)?.is::<i32>());
-    assert_eq!(r.data(&store)?.downcast_ref::<i32>().copied().unwrap(), 42);
+    assert!(r.data(&store)?.expect("should have host data").is::<i32>());
+    assert_eq!(
+        r.data(&store)?
+            .expect("should have host data")
+            .downcast_ref::<i32>()
+            .copied()
+            .unwrap(),
+        42
+    );
 
     Ok(())
 }
@@ -297,6 +314,7 @@ fn create_get_set_externref_tables_via_api() -> anyhow::Result<()> {
             .unwrap_extern()
             .unwrap()
             .data(&store)?
+            .expect("should have host data")
             .downcast_ref::<usize>()
             .unwrap(),
         42
@@ -335,6 +353,7 @@ fn fill_externref_tables_via_api() -> anyhow::Result<()> {
                 .unwrap_extern()
                 .unwrap()
                 .data(&store)?
+                .expect("should have host data")
                 .downcast_ref::<usize>()
                 .unwrap(),
             42
@@ -407,7 +426,7 @@ fn read_write_memory_via_api() {
     assert!(res.is_err());
 
     // Write offset overflow.
-    let res = mem.write(&mut store, usize::MAX, &mut buffer);
+    let res = mem.write(&mut store, usize::MAX, &buffer);
     assert!(res.is_err());
 }
 

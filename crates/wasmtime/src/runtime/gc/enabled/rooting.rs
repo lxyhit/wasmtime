@@ -103,6 +103,7 @@
 //! across the block of code that is manipulating raw GC references.
 
 use crate::runtime::vm::{GcRootsList, GcStore, VMGcRef};
+use crate::vm::VMStore;
 use crate::{prelude::*, ValRaw};
 use crate::{
     store::{AutoAssertNoGc, StoreId, StoreOpaque},
@@ -447,7 +448,7 @@ impl RootSet {
 
     pub(crate) fn with_lifo_scope<S, T>(store: &mut S, f: impl FnOnce(&mut S) -> T) -> T
     where
-        S: DerefMut<Target = StoreOpaque>,
+        S: ?Sized + DerefMut<Target = StoreOpaque>,
     {
         let scope = store.gc_roots().enter_lifo_scope();
         let ret = f(store);
@@ -496,6 +497,7 @@ impl RootSet {
 /// // have a `Rooted<ExternRef>`.
 /// let data = hello
 ///     .data(&store)?
+///     .ok_or_else(|| Error::msg("externref has no host data"))?
 ///     .downcast_ref::<&str>()
 ///     .ok_or_else(|| Error::msg("not a str"))?;
 /// assert_eq!(*data, "hello");
@@ -785,8 +787,8 @@ impl<T: GcRef> Rooted<T> {
     ///
     /// // Now we can still access the reference outside the scope it was
     /// // originally defined within.
-    /// let data = y.data(&store)?;
-    /// let data = data.downcast_ref::<&str>().unwrap();
+    /// let data = y.data(&store)?.expect("should have host data");
+    /// let data = data.downcast_ref::<&str>().expect("host data should be str");
     /// assert_eq!(*data, "hello!");
     ///
     /// // But we have to manually unroot `y`.
@@ -905,6 +907,14 @@ impl<T: GcRef> Rooted<T> {
         b: &impl RootedGcRef<T>,
     ) -> Result<bool> {
         let store = store.as_context().0;
+        Self::_ref_eq(store, a, b)
+    }
+
+    pub(crate) fn _ref_eq(
+        store: &StoreOpaque,
+        a: &impl RootedGcRef<T>,
+        b: &impl RootedGcRef<T>,
+    ) -> Result<bool> {
         let a = a.try_gc_ref(store)?;
         let b = b.try_gc_ref(store)?;
         Ok(a == b)
@@ -1191,6 +1201,89 @@ where
 {
     fn as_context_mut(&mut self) -> crate::StoreContextMut<'_, Self::Data> {
         self.store.as_context_mut()
+    }
+}
+
+pub(crate) trait AsStoreOpaqueMut {
+    fn as_store_opaque_mut(&mut self) -> &mut StoreOpaque;
+}
+
+impl<T> AsStoreOpaqueMut for T
+where
+    T: DerefMut<Target = StoreOpaque>,
+{
+    fn as_store_opaque_mut(&mut self) -> &mut StoreOpaque {
+        &mut **self
+    }
+}
+
+impl AsStoreOpaqueMut for StoreOpaque {
+    fn as_store_opaque_mut(&mut self) -> &mut StoreOpaque {
+        self
+    }
+}
+
+impl<'a> AsStoreOpaqueMut for &'a mut dyn VMStore {
+    fn as_store_opaque_mut(&mut self) -> &mut StoreOpaque {
+        self.store_opaque_mut()
+    }
+}
+
+/// Internal version of `RootScope` that only wraps a `&mut StoreOpaque` rather
+/// than a whole `impl AsContextMut<Data = T>`.
+pub(crate) struct OpaqueRootScope<S>
+where
+    S: AsStoreOpaqueMut,
+{
+    store: S,
+    scope: usize,
+}
+
+impl<S> Drop for OpaqueRootScope<S>
+where
+    S: AsStoreOpaqueMut,
+{
+    fn drop(&mut self) {
+        self.store
+            .as_store_opaque_mut()
+            .exit_gc_lifo_scope(self.scope);
+    }
+}
+
+impl<S> Deref for OpaqueRootScope<S>
+where
+    S: AsStoreOpaqueMut,
+{
+    type Target = S;
+
+    fn deref(&self) -> &Self::Target {
+        &self.store
+    }
+}
+
+// XXX: Don't use this `DerefMut` implementation to `mem::{swap,replace}` or
+// etc... the underlying `StoreOpaque` in a `OpaqueRootScope`! That will result
+// in truncating the store's GC root set's LIFO roots to the wrong length.
+//
+// We don't implement `DerefMut` for `RootScope` for exactly this reason, but
+// allow it for `OpaqueRootScope` because it is only Wasmtime-internal and not
+// publicly exported.
+impl<S> DerefMut for OpaqueRootScope<S>
+where
+    S: AsStoreOpaqueMut,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.store
+    }
+}
+
+impl<S> OpaqueRootScope<S>
+where
+    S: AsStoreOpaqueMut,
+{
+    pub(crate) fn new(mut store: S) -> Self {
+        let scope = store.as_store_opaque_mut().gc_roots().enter_lifo_scope();
+        OpaqueRootScope { store, scope }
     }
 }
 

@@ -15,7 +15,7 @@ pub struct Mmap {
 impl Mmap {
     pub fn new_empty() -> Mmap {
         Mmap {
-            memory: SendSyncPtr::from(&mut [][..]),
+            memory: crate::vm::sys::empty_mmap(),
         }
     }
 
@@ -61,13 +61,13 @@ impl Mmap {
     }
 
     #[inline]
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+    pub fn as_mut_ptr(&self) -> *mut u8 {
         self.memory.as_ptr().cast()
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        unsafe { (*self.memory.as_ptr()).len() }
+        self.memory.as_ptr().len()
     }
 
     pub unsafe fn make_executable(
@@ -102,7 +102,7 @@ impl Drop for Mmap {
     fn drop(&mut self) {
         unsafe {
             let ptr = self.memory.as_ptr().cast();
-            let len = (*self.memory.as_ptr()).len();
+            let len = self.memory.as_ptr().len();
             if len == 0 {
                 return;
             }

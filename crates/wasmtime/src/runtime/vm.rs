@@ -1,14 +1,19 @@
 //! Runtime library support for Wasmtime.
 
 #![deny(missing_docs)]
+// See documentation in crates/wasmtime/src/runtime.rs for why this is
+// selectively enabled here.
 #![warn(clippy::cast_sign_loss)]
 
 use crate::prelude::*;
+use crate::store::StoreOpaque;
 use alloc::sync::Arc;
 use core::fmt;
 use core::mem;
+use core::ops::Deref;
+use core::ops::DerefMut;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use wasmtime_environ::{
     DefinedFuncIndex, DefinedMemoryIndex, HostPtr, ModuleInternedTypeIndex, VMOffsets,
     VMSharedTypeIndex,
@@ -27,6 +32,7 @@ mod memory;
 mod mmap;
 mod mmap_vec;
 mod send_sync_ptr;
+mod send_sync_unsafe_cell;
 mod store_box;
 mod sys;
 mod table;
@@ -51,8 +57,8 @@ pub use crate::runtime::vm::gc::*;
 pub use crate::runtime::vm::imports::Imports;
 pub use crate::runtime::vm::instance::{
     GcHeapAllocationIndex, Instance, InstanceAllocationRequest, InstanceAllocator,
-    InstanceAllocatorImpl, InstanceHandle, MemoryAllocationIndex, OnDemandInstanceAllocator,
-    StorePtr, TableAllocationIndex,
+    InstanceAllocatorImpl, InstanceAndStore, InstanceHandle, MemoryAllocationIndex,
+    OnDemandInstanceAllocator, StorePtr, TableAllocationIndex,
 };
 #[cfg(feature = "pooling-allocator")]
 pub use crate::runtime::vm::instance::{
@@ -73,6 +79,7 @@ pub use crate::runtime::vm::vmcontext::{
     VMOpaqueContext, VMRuntimeLimits, VMTableImport, VMWasmCallFunction, ValRaw,
 };
 pub use send_sync_ptr::SendSyncPtr;
+pub use send_sync_unsafe_cell::SendSyncUnsafeCell;
 
 mod module_id;
 pub use module_id::CompiledModuleId;
@@ -92,27 +99,12 @@ pub use crate::runtime::vm::cow::{MemoryImage, MemoryImageSlot, ModuleMemoryImag
 /// lifetime of this store or the Send/Sync-ness of this store. All of that must
 /// be respected by embedders (e.g. the `wasmtime::Store` structure). The theory
 /// is that `wasmtime::Store` handles all this correctly.
-pub unsafe trait Store {
-    /// Returns the raw pointer in memory where this store's shared
-    /// `VMRuntimeLimits` structure is located.
-    ///
-    /// Used to configure `VMContext` initialization and store the right pointer
-    /// in the `VMContext`.
-    fn vmruntime_limits(&self) -> *mut VMRuntimeLimits;
+pub unsafe trait VMStore {
+    /// Get a shared borrow of this store's `StoreOpaque`.
+    fn store_opaque(&self) -> &StoreOpaque;
 
-    /// Returns a pointer to the global epoch counter.
-    ///
-    /// Used to configure the `VMContext` on initialization.
-    fn epoch_ptr(&self) -> *const AtomicU64;
-
-    /// Get this store's GC heap.
-    fn gc_store(&mut self) -> &mut GcStore {
-        self.maybe_gc_store()
-            .expect("attempt to access the GC store before it has been allocated")
-    }
-
-    /// Get this store's GC heap, if it has been allocated.
-    fn maybe_gc_store(&mut self) -> Option<&mut GcStore>;
+    /// Get an exclusive borrow of this store's `StoreOpaque`.
+    fn store_opaque_mut(&mut self) -> &mut StoreOpaque;
 
     /// Callback invoked to allow the store's resource limiter to reject a
     /// memory grow operation.
@@ -133,9 +125,9 @@ pub unsafe trait Store {
     /// table grow operation.
     fn table_growing(
         &mut self,
-        current: u32,
-        desired: u32,
-        maximum: Option<u32>,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
     ) -> Result<bool, Error>;
 
     /// Callback invoked to notify the store's resource limiter that a table
@@ -163,11 +155,25 @@ pub unsafe trait Store {
     ///
     /// If the async GC was cancelled, returns an error. This should be raised
     /// as a trap to clean up Wasm execution.
-    fn gc(&mut self, root: Option<VMGcRef>) -> Result<Option<VMGcRef>>;
+    fn maybe_async_gc(&mut self, root: Option<VMGcRef>) -> Result<Option<VMGcRef>>;
 
     /// Metadata required for resources for the component model.
     #[cfg(feature = "component-model")]
     fn component_calls(&mut self) -> &mut component::CallContexts;
+}
+
+impl Deref for dyn VMStore + '_ {
+    type Target = StoreOpaque;
+
+    fn deref(&self) -> &Self::Target {
+        self.store_opaque()
+    }
+}
+
+impl DerefMut for dyn VMStore + '_ {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.store_opaque_mut()
+    }
 }
 
 /// Functionality required by this crate for a particular module. This
@@ -217,7 +223,7 @@ impl ModuleRuntimeInfo {
     }
 
     /// The underlying Module.
-    pub(crate) fn module(&self) -> &Arc<wasmtime_environ::Module> {
+    pub(crate) fn env_module(&self) -> &Arc<wasmtime_environ::Module> {
         match self {
             ModuleRuntimeInfo::Module(m) => m.env_module(),
             ModuleRuntimeInfo::Bare(b) => &b.module,

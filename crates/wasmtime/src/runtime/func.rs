@@ -7,8 +7,8 @@ use crate::runtime::Uninhabited;
 use crate::store::{AutoAssertNoGc, StoreData, StoreOpaque, Stored};
 use crate::type_registry::RegisteredType;
 use crate::{
-    AsContext, AsContextMut, CallHook, Engine, Extern, FuncType, Instance, Module, Ref,
-    StoreContext, StoreContextMut, Val, ValRaw, ValType,
+    AsContext, AsContextMut, CallHook, Engine, Extern, FuncType, Instance, Module, ModuleExport,
+    Ref, StoreContext, StoreContextMut, Val, ValRaw, ValType,
 };
 use alloc::sync::Arc;
 use core::ffi::c_void;
@@ -601,18 +601,25 @@ impl Func {
     /// | `Func`                            | `(ref func)`                              |
     /// | `Option<Nofunc>`                  | `nullfuncref` aka `(ref null nofunc)`     |
     /// | `NoFunc`                          | `(ref nofunc)`                            |
-    /// | `Option<ExternRef>`               | `externref` aka `(ref null extern)`       |
-    /// | `ExternRef`                       | `(ref extern)`                            |
+    /// | `Option<Rooted<ExternRef>>`       | `externref` aka `(ref null extern)`       |
+    /// | `Rooted<ExternRef>`               | `(ref extern)`                            |
     /// | `Option<NoExtern>`                | `nullexternref` aka `(ref null noextern)` |
     /// | `NoExtern`                        | `(ref noextern)`                          |
-    /// | `Option<AnyRef>`                  | `anyref` aka `(ref null any)`             |
-    /// | `AnyRef`                          | `(ref any)`                               |
+    /// | `Option<Rooted<AnyRef>>`          | `anyref` aka `(ref null any)`             |
+    /// | `Rooted<AnyRef>`                  | `(ref any)`                               |
+    /// | `Option<Rooted<EqRef>>`           | `eqref` aka `(ref null eq)`               |
+    /// | `Rooted<EqRef>`                   | `(ref eq)`                                |
     /// | `Option<I31>`                     | `i31ref` aka `(ref null i31)`             |
     /// | `I31`                             | `(ref i31)`                               |
-    /// | `Option<StructRef>`               | `(ref null struct)`                       |
-    /// | `StructRef`                       | `(ref struct)`                            |
-    /// | `Option<ArrayRef>`                | `(ref null array)`                        |
-    /// | `ArrayRef`                        | `(ref array)`                             |
+    /// | `Option<Rooted<StructRef>>`       | `(ref null struct)`                       |
+    /// | `Rooted<StructRef>`               | `(ref struct)`                            |
+    /// | `Option<Rooted<ArrayRef>>`        | `(ref null array)`                        |
+    /// | `Rooted<ArrayRef>`                | `(ref array)`                             |
+    /// | `Option<NoneRef>`                 | `nullref` aka `(ref null none)`           |
+    /// | `NoneRef`                         | `(ref none)`                              |
+    ///
+    /// Note that anywhere a `Rooted<T>` appears, a `ManuallyRooted<T>` may also
+    /// be used.
     ///
     /// Any of the Rust types can be returned from the closure as well, in
     /// addition to some extra types
@@ -1425,18 +1432,22 @@ impl Func {
     /// | `i64`                                     | `i64` or `u64`                        |
     /// | `f32`                                     | `f32`                                 |
     /// | `f64`                                     | `f64`                                 |
-    /// | `externref` aka `(ref null extern)`       | `Option<ExternRef>`                   |
-    /// | `(ref extern)`                            | `ExternRef`                           |
-    /// | `(ref noextern)`                          | `NoExtern`                            |
+    /// | `externref` aka `(ref null extern)`       | `Option<Rooted<ExternRef>>`           |
+    /// | `(ref extern)`                            | `Rooted<ExternRef>`                   |
     /// | `nullexternref` aka `(ref null noextern)` | `Option<NoExtern>`                    |
-    /// | `anyref` aka `(ref null any)`             | `Option<AnyRef>`                      |
-    /// | `(ref any)`                               | `AnyRef`                              |
+    /// | `(ref noextern)`                          | `NoExtern`                            |
+    /// | `anyref` aka `(ref null any)`             | `Option<Rooted<AnyRef>>`              |
+    /// | `(ref any)`                               | `Rooted<AnyRef>`                      |
+    /// | `eqref` aka `(ref null eq)`               | `Option<Rooted<EqRef>>`               |
+    /// | `(ref eq)`                                | `Rooted<EqRef>`                       |
     /// | `i31ref` aka `(ref null i31)`             | `Option<I31>`                         |
     /// | `(ref i31)`                               | `I31`                                 |
-    /// | `structref` aka `(ref null struct)`       | `Option<Struct>`                      |
-    /// | `(ref struct)`                            | `Struct`                              |
-    /// | `arrayref` aka `(ref null array)`         | `Option<Array>`                       |
-    /// | `(ref array)`                             | `Array`                               |
+    /// | `structref` aka `(ref null struct)`       | `Option<Rooted<StructRef>>`           |
+    /// | `(ref struct)`                            | `Rooted<StructRef>`                   |
+    /// | `arrayref` aka `(ref null array)`         | `Option<Rooted<ArrayRef>>`            |
+    /// | `(ref array)`                             | `Rooted<ArrayRef>`                    |
+    /// | `nullref` aka `(ref null none)`           | `Option<NoneRef>`                     |
+    /// | `(ref none)`                              | `NoneRef`                             |
     /// | `funcref` aka `(ref null func)`           | `Option<Func>`                        |
     /// | `(ref func)`                              | `Func`                                |
     /// | `(ref null <func type index>)`            | `Option<Func>`                        |
@@ -1445,7 +1456,8 @@ impl Func {
     /// | `(ref nofunc)`                            | `NoFunc`                              |
     /// | `v128`                                    | `V128` on `x86-64` and `aarch64` only |
     ///
-    /// (Note that this mapping is the same as that of [`Func::wrap`]).
+    /// (Note that this mapping is the same as that of [`Func::wrap`], and that
+    /// anywhere a `Rooted<T>` appears, a `ManuallyRooted<T>` may also appear).
     ///
     /// Note that once the [`TypedFunc`] return value is acquired you'll use either
     /// [`TypedFunc::call`] or [`TypedFunc::call_async`] as necessary to actually invoke
@@ -1602,6 +1614,7 @@ pub(crate) fn invoke_wasm_and_catch_traps<T>(
             store.0.signal_handler(),
             store.0.engine().config().wasm_backtrace,
             store.0.engine().config().coredump_on_trap,
+            store.0.async_guard_range(),
             store.0.default_caller(),
             closure,
         );
@@ -2036,18 +2049,22 @@ impl<T> Caller<'_, T> {
         R: 'static,
     {
         debug_assert!(!caller.is_null());
-        crate::runtime::vm::Instance::from_vmctx(caller, |instance| {
-            let store = StoreContextMut::from_raw(instance.store());
-            let gc_lifo_scope = store.0.gc_roots().enter_lifo_scope();
+        crate::runtime::vm::InstanceAndStore::from_vmctx(caller, |pair| {
+            let (instance, mut store) = pair.unpack_context_mut::<T>();
 
-            let ret = f(Caller {
-                store,
-                caller: &instance,
-            });
+            let (gc_lifo_scope, ret) = {
+                let gc_lifo_scope = store.0.gc_roots().enter_lifo_scope();
+
+                let ret = f(Caller {
+                    store: store.as_context_mut(),
+                    caller: &instance,
+                });
+
+                (gc_lifo_scope, ret)
+            };
 
             // Safe to recreate a mutable borrow of the store because `ret`
             // cannot be borrowing from the store.
-            let store = StoreContextMut::<T>::from_raw(instance.store());
             store.0.exit_gc_lifo_scope(gc_lifo_scope);
 
             ret
@@ -2094,6 +2111,78 @@ impl<T> Caller<'_, T> {
             .host_state()
             .downcast_ref::<Instance>()?
             .get_export(&mut self.store, name)
+    }
+
+    /// Looks up an exported [`Extern`] value by a [`ModuleExport`] value.
+    ///
+    /// This is similar to [`Self::get_export`] but uses a [`ModuleExport`] value to avoid
+    /// string lookups where possible. [`ModuleExport`]s can be obtained by calling
+    /// [`Module::get_export_index`] on the [`Module`] that an instance was instantiated with.
+    ///
+    /// This method will search the module for an export with a matching entity index and return
+    /// the value, if found.
+    ///
+    /// Returns `None` if there was no export with a matching entity index.
+    /// # Panics
+    ///
+    /// Panics if `store` does not own this instance.
+    ///
+    /// # Usage
+    /// ```
+    /// use std::str;
+    ///
+    /// # use wasmtime::*;
+    /// # fn main() -> anyhow::Result<()> {
+    /// # let mut store = Store::default();
+    ///
+    /// let module = Module::new(
+    ///     store.engine(),
+    ///     r#"
+    ///         (module
+    ///             (import "" "" (func $log_str (param i32 i32)))
+    ///             (func (export "foo")
+    ///                 i32.const 4   ;; ptr
+    ///                 i32.const 13  ;; len
+    ///                 call $log_str)
+    ///             (memory (export "memory") 1)
+    ///             (data (i32.const 4) "Hello, world!"))
+    ///     "#,
+    /// )?;
+    ///
+    /// let Some(module_export) = module.get_export_index("memory") else {
+    ///    anyhow::bail!("failed to find `memory` export in module");
+    /// };
+    ///
+    /// let log_str = Func::wrap(&mut store, move |mut caller: Caller<'_, ()>, ptr: i32, len: i32| {
+    ///     let mem = match caller.get_module_export(&module_export) {
+    ///         Some(Extern::Memory(mem)) => mem,
+    ///         _ => anyhow::bail!("failed to find host memory"),
+    ///     };
+    ///     let data = mem.data(&caller)
+    ///         .get(ptr as u32 as usize..)
+    ///         .and_then(|arr| arr.get(..len as u32 as usize));
+    ///     let string = match data {
+    ///         Some(data) => match str::from_utf8(data) {
+    ///             Ok(s) => s,
+    ///             Err(_) => anyhow::bail!("invalid utf-8"),
+    ///         },
+    ///         None => anyhow::bail!("pointer/length out of bounds"),
+    ///     };
+    ///     assert_eq!(string, "Hello, world!");
+    ///     println!("{}", string);
+    ///     Ok(())
+    /// });
+    /// let instance = Instance::new(&mut store, &module, &[log_str.into()])?;
+    /// let foo = instance.get_typed_func::<(), ()>(&mut store, "foo")?;
+    /// foo.call(&mut store, ())?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_module_export(&mut self, export: &ModuleExport) -> Option<Extern> {
+        self.caller
+            .host_state()
+            .downcast_ref::<Instance>()?
+            .get_module_export(&mut self.store, export)
     }
 
     /// Access the underlying data owned by this `Store`.

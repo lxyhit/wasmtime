@@ -76,16 +76,16 @@
 //! contents of `StoreOpaque`. This is an invariant that we, as the authors of
 //! `wasmtime`, must uphold for the public interface to be safe.
 
+use crate::hash_set::HashSet;
 use crate::instance::InstanceData;
 use crate::linker::Definition;
 use crate::module::RegisteredModuleId;
 use crate::prelude::*;
 use crate::runtime::vm::mpk::{self, ProtectionKey, ProtectionMask};
 use crate::runtime::vm::{
-    Backtrace, ExportGlobal, GcHeapAllocationIndex, GcRootsList, GcStore,
-    InstanceAllocationRequest, InstanceAllocator, InstanceHandle, ModuleRuntimeInfo,
-    OnDemandInstanceAllocator, SignalHandler, StoreBox, StorePtr, VMContext, VMFuncRef, VMGcRef,
-    VMRuntimeLimits, WasmFault,
+    Backtrace, ExportGlobal, GcRootsList, GcStore, InstanceAllocationRequest, InstanceAllocator,
+    InstanceHandle, ModuleRuntimeInfo, OnDemandInstanceAllocator, SignalHandler, StoreBox,
+    StorePtr, VMContext, VMFuncRef, VMGcRef, VMRuntimeLimits, WasmFault,
 };
 use crate::trampoline::VMHostGlobalContext;
 use crate::type_registry::RegisteredType;
@@ -99,10 +99,9 @@ use core::future::Future;
 use core::marker;
 use core::mem::{self, ManuallyDrop};
 use core::num::NonZeroU64;
-use core::ops::{Deref, DerefMut};
+use core::ops::{Deref, DerefMut, Range};
 use core::pin::Pin;
 use core::ptr;
-use core::sync::atomic::AtomicU64;
 use core::task::{Context, Poll};
 
 mod context;
@@ -325,7 +324,7 @@ pub struct StoreOpaque {
     gc_roots: RootSet,
     gc_roots_list: GcRootsList,
     // Types for which the embedder has created an allocator for.
-    gc_host_alloc_types: hashbrown::HashSet<RegisteredType>,
+    gc_host_alloc_types: HashSet<RegisteredType>,
 
     // Numbers of resources instantiated in this store, and their limits
     instance_count: usize,
@@ -392,7 +391,26 @@ pub struct StoreOpaque {
 #[cfg(feature = "async")]
 struct AsyncState {
     current_suspend: UnsafeCell<*mut wasmtime_fiber::Suspend<Result<()>, (), Result<()>>>,
-    current_poll_cx: UnsafeCell<*mut Context<'static>>,
+    current_poll_cx: UnsafeCell<PollContext>,
+}
+
+#[cfg(feature = "async")]
+#[derive(Clone, Copy)]
+struct PollContext {
+    future_context: *mut Context<'static>,
+    guard_range_start: *mut u8,
+    guard_range_end: *mut u8,
+}
+
+#[cfg(feature = "async")]
+impl Default for PollContext {
+    fn default() -> PollContext {
+        PollContext {
+            future_context: core::ptr::null_mut(),
+            guard_range_start: core::ptr::null_mut(),
+            guard_range_end: core::ptr::null_mut(),
+        }
+    }
 }
 
 // Lots of pesky unsafe cells and pointers in this structure. This means we need
@@ -524,7 +542,7 @@ impl<T> Store<T> {
                 gc_store: None,
                 gc_roots: RootSet::default(),
                 gc_roots_list: GcRootsList::default(),
-                gc_host_alloc_types: hashbrown::HashSet::default(),
+                gc_host_alloc_types: HashSet::default(),
                 modules: ModuleRegistry::default(),
                 func_refs: FuncRefs::default(),
                 host_globals: Vec::new(),
@@ -537,7 +555,7 @@ impl<T> Store<T> {
                 #[cfg(feature = "async")]
                 async_state: AsyncState {
                     current_suspend: UnsafeCell::new(ptr::null_mut()),
-                    current_poll_cx: UnsafeCell::new(ptr::null_mut()),
+                    current_poll_cx: UnsafeCell::new(PollContext::default()),
                 },
                 fuel_reserve: 0,
                 fuel_yield_interval: None,
@@ -572,7 +590,7 @@ impl<T> Store<T> {
             let shim = ModuleRuntimeInfo::bare(module);
             let allocator = OnDemandInstanceAllocator::default();
             allocator
-                .validate_module(shim.module(), shim.offsets())
+                .validate_module(shim.env_module(), shim.offsets())
                 .unwrap();
             let mut instance = unsafe {
                 allocator
@@ -583,22 +601,23 @@ impl<T> Store<T> {
                         runtime_info: &shim,
                         wmemcheck: engine.config().wmemcheck,
                         pkey: None,
+                        tunables: engine.tunables(),
                     })
                     .expect("failed to allocate default callee")
             };
 
             // Note the erasure of the lifetime here into `'static`, so in
             // general usage of this trait object must be strictly bounded to
-            // the `Store` itself, and is a variant that we have to maintain
-            // throughout Wasmtime.
+            // the `Store` itself, and this is an invariant that we have to
+            // maintain throughout Wasmtime.
             unsafe {
                 let traitobj = mem::transmute::<
-                    *mut (dyn crate::runtime::vm::Store + '_),
-                    *mut (dyn crate::runtime::vm::Store + 'static),
+                    *mut (dyn crate::runtime::vm::VMStore + '_),
+                    *mut (dyn crate::runtime::vm::VMStore + 'static),
                 >(&mut *inner);
                 instance.set_store(traitobj);
+                instance
             }
-            instance
         };
 
         Self {
@@ -1273,8 +1292,8 @@ impl StoreOpaque {
         }
 
         let module = module.env_module();
-        let memories = module.memory_plans.len() - module.num_imported_memories;
-        let tables = module.table_plans.len() - module.num_imported_tables;
+        let memories = module.num_defined_memories();
+        let tables = module.num_defined_tables();
 
         bump(&mut self.instance_count, self.instance_limit, 1, "instance")?;
         bump(
@@ -1323,7 +1342,7 @@ impl StoreOpaque {
     }
 
     pub(crate) fn fill_func_refs(&mut self) {
-        self.func_refs.fill(&mut self.modules);
+        self.func_refs.fill(&self.modules);
     }
 
     pub(crate) fn push_instance_pre_func_refs(&mut self, func_refs: Arc<[VMFuncRef]>) {
@@ -1519,25 +1538,19 @@ impl StoreOpaque {
 
         #[cfg(feature = "gc")]
         fn allocate_gc_store(engine: &Engine) -> Result<GcStore> {
-            let (index, heap) = if engine.features().gc_types() {
-                engine
-                    .allocator()
-                    .allocate_gc_heap(&**engine.gc_runtime())?
-            } else {
-                (
-                    GcHeapAllocationIndex::default(),
-                    crate::runtime::vm::disabled_gc_heap(),
-                )
-            };
+            ensure!(
+                engine.features().gc_types(),
+                "cannot allocate a GC store when GC is disabled at configuration time"
+            );
+            let (index, heap) = engine
+                .allocator()
+                .allocate_gc_heap(&**engine.gc_runtime()?)?;
             Ok(GcStore::new(index, heap))
         }
 
         #[cfg(not(feature = "gc"))]
         fn allocate_gc_store(_engine: &Engine) -> Result<GcStore> {
-            Ok(GcStore::new(
-                GcHeapAllocationIndex::default(),
-                crate::runtime::vm::disabled_gc_heap(),
-            ))
+            bail!("cannot allocate a GC store: the `gc` feature was disabled at compile time")
         }
     }
 
@@ -1556,6 +1569,17 @@ impl StoreOpaque {
             self.allocate_gc_heap()?;
         }
         Ok(self.unwrap_gc_store_mut())
+    }
+
+    /// If this store is configured with a GC heap, return a mutable reference
+    /// to it. Otherwise, return `None`.
+    #[inline]
+    pub(crate) fn optional_gc_store_mut(&mut self) -> Result<Option<&mut GcStore>> {
+        if cfg!(not(feature = "gc")) || !self.engine.features().gc_types() {
+            Ok(None)
+        } else {
+            Ok(Some(self.gc_store_mut()?))
+        }
     }
 
     #[inline]
@@ -1595,6 +1619,8 @@ impl StoreOpaque {
             return;
         }
 
+        log::trace!("============ Begin GC ===========");
+
         // Take the GC roots out of `self` so we can borrow it mutably but still
         // call mutable methods on `self`.
         let mut roots = core::mem::take(&mut self.gc_roots_list);
@@ -1605,6 +1631,8 @@ impl StoreOpaque {
         // Restore the GC roots for the next GC.
         roots.clear();
         self.gc_roots_list = roots;
+
+        log::trace!("============ End GC ===========");
     }
 
     #[inline]
@@ -1643,6 +1671,8 @@ impl StoreOpaque {
             return;
         }
 
+        log::trace!("============ Begin Async GC ===========");
+
         // Take the GC roots out of `self` so we can borrow it mutably but still
         // call mutable methods on `self`.
         let mut roots = std::mem::take(&mut self.gc_roots_list);
@@ -1655,6 +1685,8 @@ impl StoreOpaque {
         // Restore the GC roots for the next GC.
         roots.clear();
         self.gc_roots_list = roots;
+
+        log::trace!("============ End Async GC ===========");
     }
 
     #[inline]
@@ -1687,9 +1719,8 @@ impl StoreOpaque {
 
     #[cfg(feature = "gc")]
     fn trace_wasm_stack_roots(&mut self, gc_roots_list: &mut GcRootsList) {
+        use crate::runtime::vm::SendSyncPtr;
         use core::ptr::NonNull;
-
-        use crate::runtime::vm::{ModuleInfoLookup, SendSyncPtr};
 
         log::trace!("Begin trace GC roots :: Wasm stack");
 
@@ -1705,7 +1736,7 @@ impl StoreOpaque {
 
             let module_info = self
                 .modules()
-                .lookup(pc)
+                .lookup_module_by_pc(pc)
                 .expect("should have module info for Wasm frame");
 
             let stack_map = match module_info.lookup_stack_map(pc) {
@@ -1781,13 +1812,13 @@ impl StoreOpaque {
         }
 
         let poll_cx_inner_ptr = unsafe { *poll_cx_box_ptr };
-        if poll_cx_inner_ptr.is_null() {
+        if poll_cx_inner_ptr.future_context.is_null() {
             return None;
         }
 
         Some(AsyncCx {
             current_suspend: self.async_state.current_suspend.get(),
-            current_poll_cx: poll_cx_box_ptr,
+            current_poll_cx: unsafe { core::ptr::addr_of_mut!((*poll_cx_box_ptr).future_context) },
             track_pkey_context_switch: self.pkey.is_some(),
         })
     }
@@ -1883,8 +1914,9 @@ impl StoreOpaque {
         self.default_caller.vmctx()
     }
 
-    pub fn traitobj(&self) -> *mut dyn crate::runtime::vm::Store {
-        self.default_caller.store()
+    #[inline]
+    pub fn traitobj(&self) -> *mut dyn crate::runtime::vm::VMStore {
+        self.default_caller.traitobj(self)
     }
 
     /// Takes the cached `Vec<Val>` stored internally across hostcalls to get
@@ -2055,6 +2087,18 @@ at https://bytecodealliance.org/security.
 
         self.num_component_instances += 1;
     }
+
+    pub(crate) fn async_guard_range(&self) -> Range<*mut u8> {
+        #[cfg(feature = "async")]
+        unsafe {
+            let ptr = self.async_state.current_poll_cx.get();
+            (*ptr).guard_range_start..(*ptr).guard_range_end
+        }
+        #[cfg(not(feature = "async"))]
+        {
+            core::ptr::null_mut()..core::ptr::null_mut()
+        }
+    }
 }
 
 impl<T> StoreContextMut<'_, T> {
@@ -2125,7 +2169,7 @@ impl<T> StoreContextMut<'_, T> {
 
         struct FiberFuture<'a> {
             fiber: Option<wasmtime_fiber::Fiber<'a, Result<()>, (), Result<()>>>,
-            current_poll_cx: *mut *mut Context<'static>,
+            current_poll_cx: *mut PollContext,
             engine: Engine,
             // See comments in `FiberFuture::resume` for this
             state: Option<crate::runtime::vm::AsyncWasmCallState>,
@@ -2261,10 +2305,21 @@ impl<T> StoreContextMut<'_, T> {
                 // On exit from this function, though, we reset the polling
                 // context back to what it was to signify that `Store` no longer
                 // has access to this pointer.
+                let guard = self
+                    .fiber()
+                    .stack()
+                    .guard_range()
+                    .unwrap_or(core::ptr::null_mut()..core::ptr::null_mut());
                 unsafe {
                     let _reset = Reset(self.current_poll_cx, *self.current_poll_cx);
-                    *self.current_poll_cx =
-                        core::mem::transmute::<&mut Context<'_>, *mut Context<'static>>(cx);
+                    *self.current_poll_cx = PollContext {
+                        future_context: core::mem::transmute::<
+                            &mut Context<'_>,
+                            *mut Context<'static>,
+                        >(cx),
+                        guard_range_start: guard.start,
+                        guard_range_end: guard.end,
+                    };
 
                     // After that's set up we resume execution of the fiber, which
                     // may also start the fiber for the first time. This either
@@ -2423,17 +2478,13 @@ impl AsyncCx {
     }
 }
 
-unsafe impl<T> crate::runtime::vm::Store for StoreInner<T> {
-    fn vmruntime_limits(&self) -> *mut VMRuntimeLimits {
-        <StoreOpaque>::vmruntime_limits(self)
+unsafe impl<T> crate::runtime::vm::VMStore for StoreInner<T> {
+    fn store_opaque(&self) -> &StoreOpaque {
+        &self.inner
     }
 
-    fn epoch_ptr(&self) -> *const AtomicU64 {
-        self.engine.epoch_counter() as *const _
-    }
-
-    fn maybe_gc_store(&mut self) -> Option<&mut GcStore> {
-        self.gc_store.as_mut()
+    fn store_opaque_mut(&mut self) -> &mut StoreOpaque {
+        &mut self.inner
     }
 
     fn memory_growing(
@@ -2479,9 +2530,9 @@ unsafe impl<T> crate::runtime::vm::Store for StoreInner<T> {
 
     fn table_growing(
         &mut self,
-        current: u32,
-        desired: u32,
-        maximum: Option<u32>,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
     ) -> Result<bool, anyhow::Error> {
         // Need to borrow async_cx before the mut borrow of the limiter.
         // self.async_cx() panicks when used with a non-async store, so
@@ -2576,7 +2627,7 @@ unsafe impl<T> crate::runtime::vm::Store for StoreInner<T> {
     }
 
     #[cfg(feature = "gc")]
-    fn gc(&mut self, root: Option<VMGcRef>) -> Result<Option<VMGcRef>> {
+    fn maybe_async_gc(&mut self, root: Option<VMGcRef>) -> Result<Option<VMGcRef>> {
         let mut scope = RootScope::new(self);
         let store = scope.as_context_mut().0;
         let store_id = store.id();
@@ -2610,7 +2661,7 @@ unsafe impl<T> crate::runtime::vm::Store for StoreInner<T> {
     }
 
     #[cfg(not(feature = "gc"))]
-    fn gc(&mut self, root: Option<VMGcRef>) -> Result<Option<VMGcRef>> {
+    fn maybe_async_gc(&mut self, root: Option<VMGcRef>) -> Result<Option<VMGcRef>> {
         Ok(root)
     }
 
@@ -2713,14 +2764,8 @@ impl Drop for StoreOpaque {
 
             #[cfg(feature = "gc")]
             if let Some(gc_store) = self.gc_store.take() {
-                if self.engine.features().gc_types() {
-                    allocator.deallocate_gc_heap(gc_store.allocation_index, gc_store.gc_heap);
-                } else {
-                    // If GC types are not enabled, we are just dealing with a
-                    // dummy GC heap.
-                    debug_assert_eq!(gc_store.allocation_index, GcHeapAllocationIndex::default());
-                    debug_assert!(gc_store.gc_heap.as_any().is::<crate::vm::DisabledGcHeap>());
-                }
+                debug_assert!(self.engine.features().gc_types());
+                allocator.deallocate_gc_heap(gc_store.allocation_index, gc_store.gc_heap);
             }
 
             #[cfg(feature = "component-model")]
@@ -2735,12 +2780,6 @@ impl Drop for StoreOpaque {
             ManuallyDrop::drop(&mut self.store_data);
             ManuallyDrop::drop(&mut self.rooted_host_funcs);
         }
-    }
-}
-
-impl crate::runtime::vm::ModuleInfoLookup for ModuleRegistry {
-    fn lookup(&self, pc: usize) -> Option<&dyn crate::runtime::vm::ModuleInfo> {
-        self.lookup_module_info(pc)
     }
 }
 

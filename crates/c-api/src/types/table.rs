@@ -1,5 +1,5 @@
 use crate::{wasm_externtype_t, wasm_limits_t, wasm_valtype_t, CExternType};
-use once_cell::unsync::OnceCell;
+use std::cell::OnceCell;
 use wasmtime::{TableType, ValType};
 
 #[repr(transparent)]
@@ -74,8 +74,8 @@ pub extern "C" fn wasm_tabletype_element(tt: &wasm_tabletype_t) -> &wasm_valtype
 pub extern "C" fn wasm_tabletype_limits(tt: &wasm_tabletype_t) -> &wasm_limits_t {
     let tt = tt.ty();
     tt.limits_cache.get_or_init(|| wasm_limits_t {
-        min: tt.ty.minimum(),
-        max: tt.ty.maximum().unwrap_or(u32::max_value()),
+        min: u32::try_from(tt.ty.minimum()).unwrap(),
+        max: u32::try_from(tt.ty.maximum().unwrap_or(u64::from(u32::MAX))).unwrap(),
     })
 }
 

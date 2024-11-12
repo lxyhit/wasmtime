@@ -409,6 +409,15 @@
             (res_hi Reg (add_reg $I64 res_hi_3 (add_reg $I64 res_hi_2 res_hi_1))))
         (mov_to_vec128 $I64X2 res_hi res_lo)))
 
+;; Special-case the lowering of a 128-bit multiply where the operands are sign
+;; or zero extended. This maps directly to `umul_wide` and `smul_wide`.
+(rule 16 (lower (has_type $I128 (imul (uextend x) (uextend y))))
+  (let ((pair RegPair (umul_wide (put_in_reg_zext64 x) (put_in_reg_zext64 y))))
+    (mov_to_vec128 $I64X2 (regpair_hi pair) (regpair_lo pair))))
+
+(rule 16 (lower (has_type $I128 (imul (sextend x) (sextend y))))
+  (let ((pair RegPair (smul_wide (put_in_reg_sext64 x) (put_in_reg_sext64 y))))
+    (mov_to_vec128 $I64X2 (regpair_hi pair) (regpair_lo pair))))
 
 ;;;; Rules for `umulhi` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -528,7 +537,8 @@
 
 ;; Implement `udiv`.
 (rule (lower (has_type (fits_in_64 ty) (udiv x y)))
-      (let (;; Look at the divisor to determine whether we need to generate
+      (let (
+            ;; Look at the divisor to determine whether we need to generate
             ;; an explicit division-by zero check.
             ;; Load up the dividend, by loading the input (possibly zero-
             ;; extended) input into the low half of the register pair,
@@ -572,7 +582,8 @@
 
 ;; Implement `sdiv`.
 (rule (lower (has_type (fits_in_64 ty) (sdiv x y)))
-      (let (;; Look at the divisor to determine whether we need to generate
+      (let (
+            ;; Look at the divisor to determine whether we need to generate
             ;; explicit division-by-zero and/or integer-overflow checks.
             (OFcheck bool (div_overflow_check_needed y))
             ;; Load up the dividend (sign-extended to 64-bit)
@@ -2270,7 +2281,7 @@
 (rule (lib_call_tls_get_offset got got_offset symbol)
       (let ((tls_offset WritableReg (temp_writable_reg $I64))
             (_ Unit (abi_for_elf_tls_get_offset))
-            (_ Unit (emit (MInst.ElfTlsGetOffset tls_offset got got_offset (writable_link_reg) symbol))))
+            (_ Unit (emit (MInst.ElfTlsGetOffset tls_offset got got_offset symbol))))
         tls_offset))
 
 (decl abi_for_elf_tls_get_offset () Unit)

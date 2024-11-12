@@ -80,9 +80,8 @@ impl Parse for Config {
         let mut opts = Opts::default();
         let mut world = None;
         let mut inline = None;
-        let mut path = None;
+        let mut paths = Vec::new();
         let mut async_configured = false;
-        let mut features = Vec::new();
         let mut include_generated_code_from_file = false;
 
         if input.peek(token::Brace) {
@@ -91,11 +90,8 @@ impl Parse for Config {
             let fields = Punctuated::<Opt, Token![,]>::parse_terminated(&content)?;
             for field in fields.into_pairs() {
                 match field.into_value() {
-                    Opt::Path(s) => {
-                        if path.is_some() {
-                            return Err(Error::new(s.span(), "cannot specify second path"));
-                        }
-                        path = Some(s.value());
+                    Opt::Path(p) => {
+                        paths.extend(p.into_iter().map(|p| p.value()));
                     }
                     Opt::World(s) => {
                         if world.is_some() {
@@ -110,6 +106,7 @@ impl Parse for Config {
                         inline = Some(s.value());
                     }
                     Opt::Tracing(val) => opts.tracing = val,
+                    Opt::VerboseTracing(val) => opts.verbose_tracing = val,
                     Opt::Async(val, span) => {
                         if async_configured {
                             return Err(Error::new(span, "cannot specify second async config"));
@@ -154,9 +151,6 @@ impl Parse for Config {
                     }
                     Opt::Stringify(val) => opts.stringify = val,
                     Opt::SkipMutForwardingImpls(val) => opts.skip_mut_forwarding_impls = val,
-                    Opt::Features(f) => {
-                        features.extend(f.into_iter().map(|f| f.value()));
-                    }
                     Opt::RequireStoreDataSend(val) => opts.require_store_data_send = val,
                     Opt::WasmtimeCrate(f) => {
                         opts.wasmtime_crate = Some(f.into_token_stream().to_string())
@@ -167,14 +161,13 @@ impl Parse for Config {
         } else {
             world = input.parse::<Option<syn::LitStr>>()?.map(|s| s.value());
             if input.parse::<Option<syn::token::In>>()?.is_some() {
-                path = Some(input.parse::<syn::LitStr>()?.value());
+                paths.push(input.parse::<syn::LitStr>()?.value());
             }
         }
-        let (resolve, pkg, files) = parse_source(&path, &inline, &features)
+        let (resolve, pkgs, files) = parse_source(&paths, &inline)
             .map_err(|err| Error::new(call_site, format!("{err:?}")))?;
 
-        let world = resolve
-            .select_world(pkg, world.as_deref())
+        let world = select_world(&resolve, &pkgs, world.as_deref())
             .map_err(|e| Error::new(call_site, format!("{e:?}")))?;
         Ok(Config {
             opts,
@@ -187,51 +180,93 @@ impl Parse for Config {
 }
 
 fn parse_source(
-    path: &Option<String>,
+    paths: &Vec<String>,
     inline: &Option<String>,
-    features: &[String],
-) -> anyhow::Result<(Resolve, PackageId, Vec<PathBuf>)> {
+) -> anyhow::Result<(Resolve, Vec<PackageId>, Vec<PathBuf>)> {
     let mut resolve = Resolve::default();
-    resolve.features.extend(features.iter().cloned());
+    resolve.all_features = true;
     let mut files = Vec::new();
+    let mut pkgs = Vec::new();
     let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
 
-    let mut parse = |resolve: &mut Resolve, path: &Path| -> anyhow::Result<_> {
-        // Try to normalize the path to make the error message more understandable when
-        // the path is not correct. Fallback to the original path if normalization fails
-        // (probably return an error somewhere else).
-        let normalized_path = match std::fs::canonicalize(path) {
-            Ok(p) => p,
-            Err(_) => path.to_path_buf(),
-        };
-        let (pkg, sources) = resolve.push_path(normalized_path)?;
-        files.extend(sources);
-        Ok(pkg)
+    let parse = |resolve: &mut Resolve,
+                 files: &mut Vec<PathBuf>,
+                 pkgs: &mut Vec<PackageId>,
+                 paths: &[String]|
+     -> anyhow::Result<_> {
+        for path in paths {
+            let p = root.join(path);
+            // Try to normalize the path to make the error message more understandable when
+            // the path is not correct. Fallback to the original path if normalization fails
+            // (probably return an error somewhere else).
+            let normalized_path = match std::fs::canonicalize(&p) {
+                Ok(p) => p,
+                Err(_) => p.to_path_buf(),
+            };
+            let (pkg, sources) = resolve.push_path(normalized_path)?;
+            pkgs.push(pkg);
+            files.extend(sources);
+        }
+        Ok(())
     };
 
-    let path_pkg = if let Some(path) = path {
-        Some(parse(&mut resolve, &root.join(path))?)
-    } else {
-        None
-    };
+    if !paths.is_empty() {
+        parse(&mut resolve, &mut files, &mut pkgs, &paths)?;
+    }
 
-    let inline_pkgs = if let Some(inline) = inline {
-        Some(resolve.push_group(UnresolvedPackageGroup::parse("macro-input", inline)?)?)
-    } else {
-        None
-    };
+    if let Some(inline) = inline {
+        pkgs.push(resolve.push_group(UnresolvedPackageGroup::parse("macro-input", inline)?)?);
+    }
 
-    let pkgs = inline_pkgs
-        .or(path_pkg)
-        .map_or_else(|| parse(&mut resolve, &root.join("wit")), Ok)?;
+    if pkgs.is_empty() {
+        parse(&mut resolve, &mut files, &mut pkgs, &["wit".into()])?;
+    }
 
     Ok((resolve, pkgs, files))
+}
+
+fn select_world(
+    resolve: &Resolve,
+    pkgs: &[PackageId],
+    world: Option<&str>,
+) -> anyhow::Result<WorldId> {
+    if pkgs.len() == 1 {
+        resolve.select_world(pkgs[0], world)
+    } else {
+        assert!(!pkgs.is_empty());
+        match world {
+            Some(name) => {
+                if !name.contains(":") {
+                    anyhow::bail!(
+                        "with multiple packages a fully qualified \
+                         world name must be specified"
+                    )
+                }
+
+                // This will ignore the package argument due to the fully
+                // qualified name being used.
+                resolve.select_world(pkgs[0], world)
+            }
+            None => {
+                let worlds = pkgs
+                    .iter()
+                    .filter_map(|p| resolve.select_world(*p, None).ok())
+                    .collect::<Vec<_>>();
+                match &worlds[..] {
+                    [] => anyhow::bail!("no packages have a world"),
+                    [world] => Ok(*world),
+                    _ => anyhow::bail!("multiple packages have a world, must specify which to use"),
+                }
+            }
+        }
+    }
 }
 
 mod kw {
     syn::custom_keyword!(inline);
     syn::custom_keyword!(path);
     syn::custom_keyword!(tracing);
+    syn::custom_keyword!(verbose_tracing);
     syn::custom_keyword!(trappable_error_type);
     syn::custom_keyword!(world);
     syn::custom_keyword!(ownership);
@@ -243,7 +278,6 @@ mod kw {
     syn::custom_keyword!(additional_derives);
     syn::custom_keyword!(stringify);
     syn::custom_keyword!(skip_mut_forwarding_impls);
-    syn::custom_keyword!(features);
     syn::custom_keyword!(require_store_data_send);
     syn::custom_keyword!(wasmtime_crate);
     syn::custom_keyword!(include_generated_code_from_file);
@@ -251,9 +285,10 @@ mod kw {
 
 enum Opt {
     World(syn::LitStr),
-    Path(syn::LitStr),
+    Path(Vec<syn::LitStr>),
     Inline(syn::LitStr),
     Tracing(bool),
+    VerboseTracing(bool),
     Async(AsyncConfig, Span),
     TrappableErrorType(Vec<TrappableError>),
     Ownership(Ownership),
@@ -263,7 +298,6 @@ enum Opt {
     AdditionalDerives(Vec<syn::Path>),
     Stringify(bool),
     SkipMutForwardingImpls(bool),
-    Features(Vec<syn::LitStr>),
     RequireStoreDataSend(bool),
     WasmtimeCrate(syn::Path),
     IncludeGeneratedCodeFromFile(bool),
@@ -275,7 +309,23 @@ impl Parse for Opt {
         if l.peek(kw::path) {
             input.parse::<kw::path>()?;
             input.parse::<Token![:]>()?;
-            Ok(Opt::Path(input.parse()?))
+
+            let mut paths: Vec<syn::LitStr> = vec![];
+
+            let l = input.lookahead1();
+            if l.peek(syn::LitStr) {
+                paths.push(input.parse()?);
+            } else if l.peek(syn::token::Bracket) {
+                let contents;
+                syn::bracketed!(contents in input);
+                let list = Punctuated::<_, Token![,]>::parse_terminated(&contents)?;
+
+                paths.extend(list.into_iter());
+            } else {
+                return Err(l.error());
+            };
+
+            Ok(Opt::Path(paths))
         } else if l.peek(kw::inline) {
             input.parse::<kw::inline>()?;
             input.parse::<Token![:]>()?;
@@ -288,6 +338,10 @@ impl Parse for Opt {
             input.parse::<kw::tracing>()?;
             input.parse::<Token![:]>()?;
             Ok(Opt::Tracing(input.parse::<syn::LitBool>()?.value))
+        } else if l.peek(kw::verbose_tracing) {
+            input.parse::<kw::verbose_tracing>()?;
+            input.parse::<Token![:]>()?;
+            Ok(Opt::VerboseTracing(input.parse::<syn::LitBool>()?.value))
         } else if l.peek(Token![async]) {
             let span = input.parse::<Token![async]>()?.span;
             input.parse::<Token![:]>()?;
@@ -417,13 +471,6 @@ impl Parse for Opt {
             Ok(Opt::SkipMutForwardingImpls(
                 input.parse::<syn::LitBool>()?.value,
             ))
-        } else if l.peek(kw::features) {
-            input.parse::<kw::features>()?;
-            input.parse::<Token![:]>()?;
-            let contents;
-            syn::bracketed!(contents in input);
-            let list = Punctuated::<_, Token![,]>::parse_terminated(&contents)?;
-            Ok(Opt::Features(list.into_iter().collect()))
         } else if l.peek(kw::require_store_data_send) {
             input.parse::<kw::require_store_data_send>()?;
             input.parse::<Token![:]>()?;

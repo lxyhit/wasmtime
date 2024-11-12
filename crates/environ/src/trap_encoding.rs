@@ -74,8 +74,14 @@ pub enum Trap {
     /// Call to a null reference.
     NullReference,
 
-    /// Attempt to get the bits of a null `i31ref`.
-    NullI31Ref,
+    /// Attempt to access beyond the bounds of an array.
+    ArrayOutOfBounds,
+
+    /// Attempted an allocation that was too large to succeed.
+    AllocationTooLarge,
+
+    /// Attempted to cast a reference to a type that it is not an instance of.
+    CastFailure,
 
     /// When the `component-model` feature is enabled this trap represents a
     /// scenario where one component tried to call another component but it
@@ -114,7 +120,9 @@ impl Trap {
             OutOfFuel
             AtomicWaitNonSharedMemory
             NullReference
-            NullI31Ref
+            ArrayOutOfBounds
+            AllocationTooLarge
+            CastFailure
             CannotEnterComponent
         }
 
@@ -142,7 +150,9 @@ impl fmt::Display for Trap {
             OutOfFuel => "all fuel consumed by WebAssembly",
             AtomicWaitNonSharedMemory => "atomic wait on non-shared memory",
             NullReference => "null reference",
-            NullI31Ref => "null i31 reference",
+            ArrayOutOfBounds => "out of bounds array access",
+            AllocationTooLarge => "allocation size too large",
+            CastFailure => "cast failure",
             CannotEnterComponent => "cannot enter component instance",
         };
         write!(f, "wasm trap: {desc}")

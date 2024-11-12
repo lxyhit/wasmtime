@@ -21,16 +21,16 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::LazyLock;
 use std::task::{Context, Poll};
 
-pub(crate) static RUNTIME: once_cell::sync::Lazy<tokio::runtime::Runtime> =
-    once_cell::sync::Lazy::new(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_time()
-            .enable_io()
-            .build()
-            .unwrap()
-    });
+pub(crate) static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_time()
+        .enable_io()
+        .build()
+        .unwrap()
+});
 
 /// Exactly like a [`tokio::task::JoinHandle`], except that it aborts the task when
 /// the handle is dropped.
@@ -42,8 +42,9 @@ pub struct AbortOnDropJoinHandle<T>(tokio::task::JoinHandle<T>);
 impl<T> AbortOnDropJoinHandle<T> {
     /// Abort the task and wait for it to finish. Optionally returns the result
     /// of the task if it ran to completion prior to being aborted.
-    pub(crate) async fn abort_wait(mut self) -> Option<T> {
+    pub(crate) async fn cancel(mut self) -> Option<T> {
         self.0.abort();
+
         match (&mut self.0).await {
             Ok(value) => Some(value),
             Err(err) if err.is_cancelled() => None,

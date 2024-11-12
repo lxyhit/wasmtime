@@ -5,7 +5,7 @@ use crate::ir::types::*;
 
 use crate::isa;
 
-use crate::isa::riscv64::inst::*;
+use crate::isa::riscv64::{inst::*, Riscv64Backend};
 use crate::isa::CallConv;
 use crate::machinst::*;
 
@@ -14,13 +14,13 @@ use crate::ir::Signature;
 use crate::isa::riscv64::settings::Flags as RiscvFlags;
 use crate::isa::unwind::UnwindInst;
 use crate::settings;
-use crate::CodegenError;
 use crate::CodegenResult;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use regalloc2::{MachineEnv, PReg, PRegSet};
 
 use smallvec::{smallvec, SmallVec};
+use std::borrow::ToOwned;
 use std::sync::OnceLock;
 
 /// Support for the Riscv64 ABI from the callee side (within a function body).
@@ -28,11 +28,6 @@ pub(crate) type Riscv64Callee = Callee<Riscv64MachineDeps>;
 
 /// Support for the Riscv64 ABI from the caller side (at a callsite).
 pub(crate) type Riscv64ABICallSite = CallSite<Riscv64MachineDeps>;
-
-/// This is the limit for the size of argument and return-value areas on the
-/// stack. We place a reasonable limit here to avoid integer overflow issues
-/// with 32-bit arithmetic: for now, 128 MB.
-static STACK_ARG_RET_SIZE_LIMIT: u32 = 128 * 1024 * 1024;
 
 /// Riscv64-specific ABI behavior. This struct just serves as an implementation
 /// point for the trait; it is never actually instantiated.
@@ -78,6 +73,11 @@ impl ABIMachineSpec for Riscv64MachineDeps {
     type I = Inst;
     type F = RiscvFlags;
 
+    /// This is the limit for the size of argument and return-value areas on the
+    /// stack. We place a reasonable limit here to avoid integer overflow issues
+    /// with 32-bit arithmetic: for now, 128 MB.
+    const STACK_ARG_RET_SIZE_LIMIT: u32 = 128 * 1024 * 1024;
+
     fn word_bits() -> u32 {
         64
     }
@@ -89,7 +89,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
 
     fn compute_arg_locs(
         call_conv: isa::CallConv,
-        _flags: &settings::Flags,
+        flags: &settings::Flags,
         params: &[ir::AbiParam],
         args_or_rets: ArgsOrRets,
         add_ret_area_ptr: bool,
@@ -112,18 +112,25 @@ impl ABIMachineSpec for Riscv64MachineDeps {
         // Stack space.
         let mut next_stack: u32 = 0;
 
+        let ret_area_ptr = if add_ret_area_ptr {
+            assert!(ArgsOrRets::Args == args_or_rets);
+            next_x_reg += 1;
+            Some(ABIArg::reg(
+                x_reg(x_start).to_real_reg().unwrap(),
+                I64,
+                ir::ArgumentExtension::None,
+                ir::ArgumentPurpose::Normal,
+            ))
+        } else {
+            None
+        };
+
         for param in params {
-            if let ir::ArgumentPurpose::StructArgument(size) = param.purpose {
-                let offset = next_stack;
-                assert!(size % 8 == 0, "StructArgument size is not properly aligned");
-                next_stack += size;
-                args.push(ABIArg::StructArg {
-                    pointer: None,
-                    offset: offset as i64,
-                    size: size as u64,
-                    purpose: param.purpose,
-                });
-                continue;
+            if let ir::ArgumentPurpose::StructArgument(_) = param.purpose {
+                panic!(
+                    "StructArgument parameters are not supported on riscv64. \
+                    Use regular pointer arguments instead."
+                );
             }
 
             // Find regclass(es) of the register(s) used to store a value of this type.
@@ -148,6 +155,14 @@ impl ABIMachineSpec for Riscv64MachineDeps {
                         extension: param.extension,
                     });
                 } else {
+                    if args_or_rets == ArgsOrRets::Rets && !flags.enable_multi_ret_implicit_sret() {
+                        return Err(crate::CodegenError::Unsupported(
+                            "Too many return values to fit in registers. \
+                            Use a StructReturn argument instead. (#9510)"
+                                .to_owned(),
+                        ));
+                    }
+
                     // Compute size and 16-byte stack alignment happens
                     // separately after all args.
                     let size = reg_ty.bits() / 8;
@@ -168,38 +183,14 @@ impl ABIMachineSpec for Riscv64MachineDeps {
                 purpose: param.purpose,
             });
         }
-        let pos: Option<usize> = if add_ret_area_ptr {
-            assert!(ArgsOrRets::Args == args_or_rets);
-            if next_x_reg <= x_end {
-                let arg = ABIArg::reg(
-                    x_reg(next_x_reg).to_real_reg().unwrap(),
-                    I64,
-                    ir::ArgumentExtension::None,
-                    ir::ArgumentPurpose::Normal,
-                );
-                args.push(arg);
-            } else {
-                let arg = ABIArg::stack(
-                    next_stack as i64,
-                    I64,
-                    ir::ArgumentExtension::None,
-                    ir::ArgumentPurpose::Normal,
-                );
-                args.push(arg);
-                next_stack += 8;
-            }
+        let pos = if let Some(ret_area_ptr) = ret_area_ptr {
+            args.push_non_formal(ret_area_ptr);
             Some(args.args().len() - 1)
         } else {
             None
         };
 
         next_stack = align_to(next_stack, Self::stack_align(call_conv));
-
-        // To avoid overflow issues, limit the arg/return size to something
-        // reasonable -- here, 128 MB.
-        if next_stack > STACK_ARG_RET_SIZE_LIMIT {
-            return Err(CodegenError::ImplLimitExceeded);
-        }
 
         Ok((next_stack, pos))
     }
@@ -287,7 +278,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
             cc: IntCC::UnsignedLessThan,
             rs1: stack_reg(),
             rs2: limit_reg,
-            trap_code: ir::TrapCode::StackOverflow,
+            trap_code: ir::TrapCode::STACK_OVERFLOW,
         });
         insts
     }
@@ -725,7 +716,12 @@ impl ABIMachineSpec for Riscv64MachineDeps {
 }
 
 impl Riscv64ABICallSite {
-    pub fn emit_return_call(mut self, ctx: &mut Lower<Inst>, args: isle::ValueSlice) {
+    pub fn emit_return_call(
+        mut self,
+        ctx: &mut Lower<Inst>,
+        args: isle::ValueSlice,
+        _backend: &Riscv64Backend,
+    ) {
         let new_stack_arg_size =
             u32::try_from(self.sig(ctx.sigs()).sized_stack_arg_space()).unwrap();
 

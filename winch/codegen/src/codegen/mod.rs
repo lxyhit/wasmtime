@@ -1,25 +1,25 @@
 use crate::{
     abi::{scratch, vmctx, ABIOperand, ABISig, RetArea},
     codegen::BlockSig,
-    isa::reg::Reg,
+    isa::reg::{writable, Reg},
     masm::{
         ExtendKind, IntCmpKind, MacroAssembler, OperandSize, RegImm, SPOffset, ShiftKind, TrapCode,
     },
     stack::TypedReg,
 };
 use anyhow::Result;
+use cranelift_codegen::{
+    binemit::CodeOffset,
+    ir::{RelSourceLoc, SourceLoc},
+};
 use smallvec::SmallVec;
 use wasmparser::{
     BinaryReader, FuncValidator, MemArg, Operator, ValidatorResources, VisitOperator,
 };
+use wasmtime_cranelift::{TRAP_BAD_SIGNATURE, TRAP_TABLE_OUT_OF_BOUNDS};
 use wasmtime_environ::{
-    GlobalIndex, MemoryIndex, PtrSize, TableIndex, TypeIndex, WasmHeapType, WasmValType,
+    GlobalIndex, MemoryIndex, PtrSize, TableIndex, Tunables, TypeIndex, WasmHeapType, WasmValType,
     FUNCREF_MASK,
-};
-
-use cranelift_codegen::{
-    binemit::CodeOffset,
-    ir::{RelSourceLoc, SourceLoc},
 };
 
 mod context;
@@ -76,6 +76,12 @@ where
     /// Flag indicating whether during translation an unsupported instruction
     /// was found.
     pub found_unsupported_instruction: Option<&'static str>,
+
+    /// Compilation settings for code generation.
+    pub tunables: &'a Tunables,
+
+    /// Local counter to track fuel consumption.
+    pub fuel_consumed: i64,
 }
 
 impl<'a, 'translation, 'data, M> CodeGen<'a, 'translation, 'data, M>
@@ -83,6 +89,7 @@ where
     M: MacroAssembler,
 {
     pub fn new(
+        tunables: &'a Tunables,
         masm: &'a mut M,
         context: CodeGenContext<'a>,
         env: FuncEnv<'a, 'translation, 'data, M::Ptr>,
@@ -93,9 +100,12 @@ where
             context,
             masm,
             env,
+            tunables,
             source_location: Default::default(),
             control_frames: Default::default(),
             found_unsupported_instruction: None,
+            // Empty functions should consume at least 1 fuel unit.
+            fuel_consumed: 1,
         }
     }
 
@@ -133,13 +143,21 @@ where
         self.masm.start_source_loc(Default::default());
         // We need to use the vmctx parameter before pinning it for stack checking.
         self.masm.prologue(vmctx);
+
         // Pin the `VMContext` pointer.
-        self.masm
-            .mov(vmctx.into(), vmctx!(M), self.env.ptr_type().into());
+        self.masm.mov(
+            writable!(vmctx!(M)),
+            vmctx.into(),
+            self.env.ptr_type().into(),
+        );
 
         self.masm.reserve_stack(self.context.frame.locals_size);
 
         self.masm.end_source_loc();
+
+        if self.tunables.consume_fuel {
+            self.emit_fuel_check();
+        }
 
         // Once we have emitted the epilogue and reserved stack space for the locals, we push the
         // base control flow block.
@@ -242,21 +260,15 @@ where
         struct ValidateThenVisit<'a, T, U>(T, &'a mut U, usize);
 
         macro_rules! validate_then_visit {
-            ($( @$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident)*) => {
+            ($( @$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident $ann:tt)*) => {
                 $(
                     fn $visit(&mut self $($(,$arg: $argty)*)?) -> Self::Output {
                         self.0.$visit($($($arg.clone()),*)?)?;
-                        // Only visit operators if the compiler is in a reachable code state. If
-                        // the compiler is in an unreachable code state, most of the operators are
-                        // ignored except for If, Block, Loop, Else and End. These operators need
-                        // to be observed in order to keep the control stack frames balanced and to
-                        // determine if reachability should be restored.
-                        let visit_when_unreachable = visit_op_when_unreachable(Operator::$op $({ $($arg: $arg.clone()),* })?);
-                        if self.1.is_reachable() || visit_when_unreachable  {
-                            let location = SourceLoc::new(self.2 as u32);
-                            self.1.start(location);
+                        let op = Operator::$op $({ $($arg: $arg.clone()),* })?;
+                        if self.1.visit(&op) {
+                            self.1.before_visit_op(&op, self.2);
                             let res = Ok(self.1.$visit($($($arg),*)?));
-                            self.1.end();
+                            self.1.after_visit_op();
                             res
                         } else {
                             Ok(U::Output::default())
@@ -266,7 +278,7 @@ where
             };
         }
 
-        fn visit_op_when_unreachable(op: Operator) -> bool {
+        fn visit_op_when_unreachable(op: &Operator) -> bool {
             use Operator::*;
             match op {
                 If { .. } | Block { .. } | Loop { .. } | Else | End => true,
@@ -274,51 +286,52 @@ where
             }
         }
 
-        /// Trait to handle reachability state.
-        trait ReachableState {
-            /// Returns true if the current state of the program is reachable.
-            fn is_reachable(&self) -> bool;
+        /// Trait to handle hooks that must happen before and after visiting an
+        /// operator.
+        trait VisitorHooks {
+            /// Hook prior to visiting an operator.
+            fn before_visit_op(&mut self, operator: &Operator, offset: usize);
+            /// Hook after visiting an operator.
+            fn after_visit_op(&mut self);
+
+            /// Returns `true` if the operator will be visited.
+            ///
+            /// Operators will be visited if the following invariants are met:
+            /// * The compiler is in a reachable state.
+            /// * The compiler is in an unreachable state, but the current
+            ///   operator is a control flow operator. These operators need to be
+            ///   visited in order to keep the control stack frames balanced and
+            ///   to determine if the reachability state must be restored.
+            fn visit(&self, op: &Operator) -> bool;
         }
 
-        /// Trait to map source locations to machine code.
-        trait SourceLocator {
-            fn start(&mut self, loc: SourceLoc);
-            fn end(&mut self);
-        }
-
-        impl<'a, 'translation, 'data, M: MacroAssembler> ReachableState
+        impl<'a, 'translation, 'data, M: MacroAssembler> VisitorHooks
             for CodeGen<'a, 'translation, 'data, M>
         {
-            fn is_reachable(&self) -> bool {
-                self.context.reachable
-            }
-        }
-
-        impl<'a, 'translation, 'data, M: MacroAssembler> SourceLocator
-            for CodeGen<'a, 'translation, 'data, M>
-        {
-            fn start(&mut self, loc: SourceLoc) {
-                let rel = self.source_loc_from(loc);
-                self.source_location.current = self.masm.start_source_loc(rel);
+            fn visit(&self, op: &Operator) -> bool {
+                self.context.reachable || visit_op_when_unreachable(op)
             }
 
-            fn end(&mut self) {
-                // Because in Winch binary emission is done in a single pass
-                // and because the MachBuffer performs optimizations during
-                // emission, we have to be careful when calling
-                // [MacroAssembler::end_source_location] to avoid breaking the
-                // invariant that checks that the end [CodeOffset] must be equal
-                // or greater than the start [CodeOffset].
-                if self.masm.current_code_offset() >= self.source_location.current.0 {
-                    self.masm.end_source_loc();
+            fn before_visit_op(&mut self, operator: &Operator, offset: usize) {
+                // Handle source location mapping.
+                self.source_location_before_visit_op(offset);
+
+                // Handle fuel.
+                if self.tunables.consume_fuel {
+                    self.fuel_before_visit_op(operator);
                 }
+            }
+
+            fn after_visit_op(&mut self) {
+                // Handle source code location mapping.
+                self.source_location_after_visit_op();
             }
         }
 
         impl<'a, T, U> VisitOperator<'a> for ValidateThenVisit<'_, T, U>
         where
             T: VisitOperator<'a, Output = wasmparser::Result<()>>,
-            U: VisitOperator<'a> + ReachableState + SourceLocator,
+            U: VisitOperator<'a> + VisitorHooks,
             U::Output: Default,
         {
             type Output = Result<U::Output>;
@@ -344,7 +357,7 @@ where
         // Load the signatures address into the scratch register.
         self.masm.load(
             self.masm.address_at_vmctx(signatures_base_offset.into()),
-            scratch,
+            writable!(scratch),
             ptr_size,
         );
 
@@ -352,7 +365,7 @@ where
         let caller_id = self.context.any_gpr(self.masm);
         self.masm.load(
             self.masm.address_at_reg(scratch, sig_offset),
-            caller_id,
+            writable!(caller_id),
             sig_size,
         );
 
@@ -360,13 +373,13 @@ where
         self.masm.load(
             self.masm
                 .address_at_reg(funcref_ptr, funcref_sig_offset.into()),
-            callee_id,
+            writable!(callee_id),
             sig_size,
         );
 
         // Typecheck.
         self.masm.cmp(caller_id, callee_id.into(), OperandSize::S32);
-        self.masm.trapif(IntCmpKind::Ne, TrapCode::BadSignature);
+        self.masm.trapif(IntCmpKind::Ne, TRAP_BAD_SIGNATURE);
         self.context.free_reg(callee_id);
         self.context.free_reg(caller_id);
     }
@@ -454,7 +467,7 @@ where
         let addr = if data.imported {
             let global_base = self.masm.address_at_reg(vmctx!(M), data.offset);
             let scratch = scratch!(M);
-            self.masm.load_ptr(global_base, scratch);
+            self.masm.load_ptr(global_base, writable!(scratch));
             self.masm.address_at_reg(scratch, 0)
         } else {
             self.masm.address_at_reg(vmctx!(M), data.offset)
@@ -464,6 +477,7 @@ where
     }
 
     pub fn emit_lazy_init_funcref(&mut self, table_index: TableIndex) {
+        assert!(self.tunables.table_lazy_init, "unsupported eager init");
         let table_data = self.env.resolve_table_data(table_index);
         let ptr_type = self.env.ptr_type();
         let builtin = self
@@ -488,7 +502,7 @@ where
         let base = self.context.any_gpr(self.masm);
 
         let elem_addr = self.emit_compute_table_elem_addr(index.into(), base, &table_data);
-        self.masm.load_ptr(elem_addr, elem_value);
+        self.masm.load_ptr(elem_addr, writable!(elem_value));
         // Free the register used as base, once we have loaded the element
         // address into the element value register.
         self.context.free_reg(base);
@@ -531,7 +545,7 @@ where
         self.masm.bind(defined);
         let imm = RegImm::i64(FUNCREF_MASK as i64);
         let dst = top.into();
-        self.masm.and(dst, dst, imm, top.ty.into());
+        self.masm.and(writable!(dst), dst, imm, top.ty.into());
 
         self.masm.bind(cont);
     }
@@ -547,7 +561,7 @@ where
     ///
     /// Winch follows almost the same principles as Cranelift when it comes to
     /// bounds checks, for a more detailed explanation refer to
-    /// [cranelift_wasm::code_translator::prepare_addr].
+    /// prepare_addr in wasmtime-cranelift.
     ///
     /// Winch implementation differs in that, it defaults to the general case
     /// for dynamic heaps rather than optimizing for doing the least amount of
@@ -570,175 +584,178 @@ where
         let memory_index = MemoryIndex::from_u32(memarg.memory);
         let heap = self.env.resolve_heap(memory_index);
         let index = Index::from_typed_reg(self.context.pop_to_reg(self.masm, None));
-        let offset =
-            bounds::ensure_index_and_offset(self.masm, index, memarg.offset, heap.ty.into());
+        let offset = bounds::ensure_index_and_offset(
+            self.masm,
+            index,
+            memarg.offset,
+            heap.index_type().into(),
+        );
         let offset_with_access_size = add_offset_and_access_size(offset, access_size);
 
-        let addr = match heap.style {
-            // == Dynamic Heaps ==
+        let can_elide_bounds_check = heap
+            .memory
+            .can_elide_bounds_check(self.tunables, self.env.page_size_log2);
 
-            // Account for the general case for dynamic memories. The access is
-            // out of bounds if:
-            // * index + offset + access_size overflows
-            //   OR
-            // * index + offset + access_size > bound
-            HeapStyle::Dynamic => {
-                let bounds =
-                    bounds::load_dynamic_heap_bounds(&mut self.context, self.masm, &heap, ptr_size);
-
-                let index_reg = index.as_typed_reg().reg;
-                // Allocate a temporary register to hold
-                //      index + offset + access_size
-                //  which will serve as the check condition.
-                let index_offset_and_access_size = self.context.any_gpr(self.masm);
-
-                // Move the value of the index to the
-                // index_offset_and_access_size register to perform the overflow
-                // check to avoid clobbering the initial index value.
-                //
-                // We derive size of the operation from the heap type since:
-                //
-                // * This is the first assignment to the
-                // `index_offset_and_access_size` register
-                //
-                // * The memory64 proposal specifies that the index is bound to
-                // the heap type instead of hardcoding it to 32-bits (i32).
-                self.masm.mov(
-                    index_reg.into(),
-                    index_offset_and_access_size,
-                    heap.ty.into(),
-                );
-                // Perform
-                // index = index + offset + access_size, trapping if the
-                // addition overflows.
-                //
-                // We use the target's pointer size rather than depending on the heap
-                // type since we want to check for overflow; even though the
-                // offset and access size are guaranteed to be bounded by the heap
-                // type, when added, if used with the wrong operand size, their
-                // result could be clamped, resulting in an erroneus overflow
-                // check.
-                self.masm.checked_uadd(
-                    index_offset_and_access_size,
-                    index_offset_and_access_size,
-                    RegImm::i64(offset_with_access_size as i64),
-                    ptr_size,
-                    TrapCode::HeapOutOfBounds,
-                );
-
-                let addr = bounds::load_heap_addr_checked(
-                    self.masm,
-                    &mut self.context,
-                    ptr_size,
-                    &heap,
-                    enable_spectre_mitigation,
-                    bounds,
-                    index,
-                    offset,
-                    |masm, bounds, _| {
-                        let bounds_reg = bounds.as_typed_reg().reg;
-                        masm.cmp(
-                            index_offset_and_access_size.into(),
-                            bounds_reg.into(),
-                            // We use the pointer size to keep the bounds
-                            // comparison consistent with the result of the
-                            // overflow check above.
-                            ptr_size,
-                        );
-                        IntCmpKind::GtU
-                    },
-                );
-                self.context.free_reg(bounds.as_typed_reg().reg);
-                self.context.free_reg(index_offset_and_access_size);
-                Some(addr)
-            }
-
-            // == Static Heaps ==
-
+        let addr = if offset_with_access_size > heap.memory.maximum_byte_size().unwrap_or(u64::MAX)
+        {
             // Detect at compile time if the access is out of bounds.
             // Doing so will put the compiler in an unreachable code state,
             // optimizing the work that the compiler has to do until the
             // reachability is restored or when reaching the end of the
             // function.
-            HeapStyle::Static { bound } if offset_with_access_size > bound => {
-                self.masm.trap(TrapCode::HeapOutOfBounds);
-                self.context.reachable = false;
-                None
-            }
 
-            // Account for the case in which we can completely elide the bounds
-            // checks.
-            //
-            // This case, makes use of the fact that if a memory access uses
-            // a 32-bit index, then we be certain that
-            //
-            //      index <= u32::MAX
-            //
-            // Therefore if any 32-bit index access occurs in the region
-            // represented by
-            //
-            //      bound + guard_size - (offset + access_size)
-            //
-            // We are certain that it's in bounds or that the underlying virtual
-            // memory subsystem will report an illegal access at runtime.
-            //
-            // Note:
-            //
-            // * bound - (offset + access_size) cannot wrap, because it's checked
-            // in the condition above.
-            // * bound + heap.offset_guard_size is guaranteed to not overflow if
-            // the heap configuration is correct, given that it's address must
-            // fit in 64-bits.
-            // * If the heap type is 32-bits, the offset is at most u32::MAX, so
-            // no  adjustment is needed as part of
-            // [bounds::ensure_index_and_offset].
-            HeapStyle::Static { bound }
-                if heap.ty == WasmValType::I32
-                    && u64::from(u32::MAX)
-                        <= u64::from(bound) + u64::from(heap.offset_guard_size)
-                            - offset_with_access_size =>
-            {
-                let addr = self.context.any_gpr(self.masm);
-                bounds::load_heap_addr_unchecked(self.masm, &heap, index, offset, addr, ptr_size);
-                Some(addr)
-            }
+            self.emit_fuel_increment();
+            self.masm.trap(TrapCode::HEAP_OUT_OF_BOUNDS);
+            self.context.reachable = false;
+            None
+        } else if !can_elide_bounds_check {
+            // Account for the general case for bounds-checked memories. The
+            // access is out of bounds if:
+            // * index + offset + access_size overflows
+            //   OR
+            // * index + offset + access_size > bound
+            let bounds =
+                bounds::load_dynamic_heap_bounds(&mut self.context, self.masm, &heap, ptr_size);
 
-            // Account for the general case of static memories. The access is out
-            // of bounds if:
+            let index_reg = index.as_typed_reg().reg;
+            // Allocate a temporary register to hold
+            //      index + offset + access_size
+            //  which will serve as the check condition.
+            let index_offset_and_access_size = self.context.any_gpr(self.masm);
+
+            // Move the value of the index to the
+            // index_offset_and_access_size register to perform the overflow
+            // check to avoid clobbering the initial index value.
             //
-            // index > bound - (offset + access_size)
+            // We derive size of the operation from the heap type since:
             //
-            // bound - (offset + access_size) cannot wrap, because we already
-            // checked that (offset + access_size) > bound, above.
-            HeapStyle::Static { bound } => {
-                let bounds = Bounds::from_u64(bound);
-                let addr = bounds::load_heap_addr_checked(
-                    self.masm,
-                    &mut self.context,
-                    ptr_size,
-                    &heap,
-                    enable_spectre_mitigation,
-                    bounds,
-                    index,
-                    offset,
-                    |masm, bounds, index| {
-                        let adjusted_bounds = bounds.as_u64() - offset_with_access_size;
-                        let index_reg = index.as_typed_reg().reg;
-                        masm.cmp(
-                            index_reg,
-                            RegImm::i64(adjusted_bounds as i64),
-                            // Similar to the dynamic heap case, even though the
-                            // offset and access size are bound through the heap
-                            // type, when added they can overflow, resulting in
-                            // an erroneus comparison, therfore we rely on the
-                            // target pointer size.
-                            ptr_size,
-                        );
-                        IntCmpKind::GtU
-                    },
-                );
-                Some(addr)
-            }
+            // * This is the first assignment to the
+            // `index_offset_and_access_size` register
+            //
+            // * The memory64 proposal specifies that the index is bound to
+            // the heap type instead of hardcoding it to 32-bits (i32).
+            self.masm.mov(
+                writable!(index_offset_and_access_size),
+                index_reg.into(),
+                heap.index_type().into(),
+            );
+            // Perform
+            // index = index + offset + access_size, trapping if the
+            // addition overflows.
+            //
+            // We use the target's pointer size rather than depending on the heap
+            // type since we want to check for overflow; even though the
+            // offset and access size are guaranteed to be bounded by the heap
+            // type, when added, if used with the wrong operand size, their
+            // result could be clamped, resulting in an erroneus overflow
+            // check.
+            self.masm.checked_uadd(
+                writable!(index_offset_and_access_size),
+                index_offset_and_access_size,
+                RegImm::i64(offset_with_access_size as i64),
+                ptr_size,
+                TrapCode::HEAP_OUT_OF_BOUNDS,
+            );
+
+            let addr = bounds::load_heap_addr_checked(
+                self.masm,
+                &mut self.context,
+                ptr_size,
+                &heap,
+                enable_spectre_mitigation,
+                bounds,
+                index,
+                offset,
+                |masm, bounds, _| {
+                    let bounds_reg = bounds.as_typed_reg().reg;
+                    masm.cmp(
+                        index_offset_and_access_size.into(),
+                        bounds_reg.into(),
+                        // We use the pointer size to keep the bounds
+                        // comparison consistent with the result of the
+                        // overflow check above.
+                        ptr_size,
+                    );
+                    IntCmpKind::GtU
+                },
+            );
+            self.context.free_reg(bounds.as_typed_reg().reg);
+            self.context.free_reg(index_offset_and_access_size);
+            Some(addr)
+
+        // Account for the case in which we can completely elide the bounds
+        // checks.
+        //
+        // This case, makes use of the fact that if a memory access uses
+        // a 32-bit index, then we be certain that
+        //
+        //      index <= u32::MAX
+        //
+        // Therefore if any 32-bit index access occurs in the region
+        // represented by
+        //
+        //      bound + guard_size - (offset + access_size)
+        //
+        // We are certain that it's in bounds or that the underlying virtual
+        // memory subsystem will report an illegal access at runtime.
+        //
+        // Note:
+        //
+        // * bound - (offset + access_size) cannot wrap, because it's checked
+        // in the condition above.
+        // * bound + heap.offset_guard_size is guaranteed to not overflow if
+        // the heap configuration is correct, given that it's address must
+        // fit in 64-bits.
+        // * If the heap type is 32-bits, the offset is at most u32::MAX, so
+        // no  adjustment is needed as part of
+        // [bounds::ensure_index_and_offset].
+        } else if u64::from(u32::MAX)
+            <= self.tunables.memory_reservation + self.tunables.memory_guard_size
+                - offset_with_access_size
+        {
+            assert!(can_elide_bounds_check);
+            assert!(heap.index_type() == WasmValType::I32);
+            let addr = self.context.any_gpr(self.masm);
+            bounds::load_heap_addr_unchecked(self.masm, &heap, index, offset, addr, ptr_size);
+            Some(addr)
+
+        // Account for the all remaining cases, aka. The access is out
+        // of bounds if:
+        //
+        // index > bound - (offset + access_size)
+        //
+        // bound - (offset + access_size) cannot wrap, because we already
+        // checked that (offset + access_size) > bound, above.
+        } else {
+            assert!(can_elide_bounds_check);
+            assert!(heap.index_type() == WasmValType::I32);
+            let bounds = Bounds::from_u64(self.tunables.memory_reservation);
+            let addr = bounds::load_heap_addr_checked(
+                self.masm,
+                &mut self.context,
+                ptr_size,
+                &heap,
+                enable_spectre_mitigation,
+                bounds,
+                index,
+                offset,
+                |masm, bounds, index| {
+                    let adjusted_bounds = bounds.as_u64() - offset_with_access_size;
+                    let index_reg = index.as_typed_reg().reg;
+                    masm.cmp(
+                        index_reg,
+                        RegImm::i64(adjusted_bounds as i64),
+                        // Similar to the dynamic heap case, even though the
+                        // offset and access size are bound through the heap
+                        // type, when added they can overflow, resulting in
+                        // an erroneus comparison, therfore we rely on the
+                        // target pointer size.
+                        ptr_size,
+                    );
+                    IntCmpKind::GtU
+                },
+            );
+            Some(addr)
         };
 
         self.context.free_reg(index.as_typed_reg().reg);
@@ -762,7 +779,7 @@ where
             };
 
             let src = self.masm.address_at_reg(addr, 0);
-            self.masm.wasm_load(src, dst, size, sextend);
+            self.masm.wasm_load(src, writable!(dst), size, sextend);
             self.context.stack.push(TypedReg::new(ty, dst).into());
             self.context.free_reg(addr);
         }
@@ -797,11 +814,12 @@ where
             // If the table data declares a particular offset base,
             // load the address into a register to further use it as
             // the table address.
-            self.masm.load_ptr(self.masm.address_at_vmctx(offset), base);
+            self.masm
+                .load_ptr(self.masm.address_at_vmctx(offset), writable!(base));
         } else {
             // Else, simply move the vmctx register into the addr register as
             // the base to calculate the table address.
-            self.masm.mov(vmctx!(M).into(), base, ptr_size);
+            self.masm.mov(writable!(base), vmctx!(M).into(), ptr_size);
         };
 
         // OOB check.
@@ -809,34 +827,38 @@ where
             .masm
             .address_at_reg(base, table_data.current_elems_offset);
         let bound_size = table_data.current_elements_size;
-        self.masm.load(bound_addr, bound, bound_size.into());
-        self.masm.cmp(index, bound.into(), bound_size);
         self.masm
-            .trapif(IntCmpKind::GeU, TrapCode::TableOutOfBounds);
+            .load(bound_addr, writable!(bound), bound_size.into());
+        self.masm.cmp(index, bound.into(), bound_size);
+        self.masm.trapif(IntCmpKind::GeU, TRAP_TABLE_OUT_OF_BOUNDS);
 
         // Move the index into the scratch register to calculate the table
         // element address.
         // Moving the value of the index register to the scratch register
         // also avoids overwriting the context of the index register.
-        self.masm.mov(index.into(), scratch, bound_size);
+        self.masm.mov(writable!(scratch), index.into(), bound_size);
         self.masm.mul(
-            scratch,
+            writable!(scratch),
             scratch,
             RegImm::i32(table_data.element_size.bytes() as i32),
             table_data.element_size,
         );
-        self.masm
-            .load_ptr(self.masm.address_at_reg(base, table_data.offset), base);
+        self.masm.load_ptr(
+            self.masm.address_at_reg(base, table_data.offset),
+            writable!(base),
+        );
         // Copy the value of the table base into a temporary register
         // so that we can use it later in case of a misspeculation.
-        self.masm.mov(base.into(), tmp, ptr_size);
+        self.masm.mov(writable!(tmp), base.into(), ptr_size);
         // Calculate the address of the table element.
-        self.masm.add(base, base, scratch.into(), ptr_size);
+        self.masm
+            .add(writable!(base), base, scratch.into(), ptr_size);
         if self.env.table_access_spectre_mitigation() {
             // Perform a bounds check and override the value of the
             // table element address in case the index is out of bounds.
             self.masm.cmp(index, bound.into(), OperandSize::S32);
-            self.masm.cmov(tmp, base, IntCmpKind::GeU, ptr_size);
+            self.masm
+                .cmov(writable!(base), tmp, IntCmpKind::GeU, ptr_size);
         }
         self.context.free_reg(bound);
         self.context.free_reg(tmp);
@@ -851,16 +873,20 @@ where
 
         if let Some(offset) = table_data.import_from {
             self.masm
-                .load_ptr(self.masm.address_at_vmctx(offset), scratch);
+                .load_ptr(self.masm.address_at_vmctx(offset), writable!(scratch));
         } else {
-            self.masm.mov(vmctx!(M).into(), scratch, ptr_size);
+            self.masm
+                .mov(writable!(scratch), vmctx!(M).into(), ptr_size);
         };
 
         let size_addr = self
             .masm
             .address_at_reg(scratch, table_data.current_elems_offset);
-        self.masm
-            .load(size_addr, size, table_data.current_elements_size.into());
+        self.masm.load(
+            size_addr,
+            writable!(size),
+            table_data.current_elements_size.into(),
+        );
 
         self.context.stack.push(TypedReg::i32(size).into());
     }
@@ -872,7 +898,7 @@ where
 
         let base = if let Some(offset) = heap_data.import_from {
             self.masm
-                .load_ptr(self.masm.address_at_vmctx(offset), scratch);
+                .load_ptr(self.masm.address_at_vmctx(offset), writable!(scratch));
             scratch
         } else {
             vmctx!(M)
@@ -881,18 +907,191 @@ where
         let size_addr = self
             .masm
             .address_at_reg(base, heap_data.current_length_offset);
-        self.masm.load_ptr(size_addr, size_reg);
+        self.masm.load_ptr(size_addr, writable!(size_reg));
         // Emit a shift to get the size in pages rather than in bytes.
-        let dst = TypedReg::new(heap_data.ty, size_reg);
-        let pow = heap_data.page_size_log2;
+        let dst = TypedReg::new(heap_data.index_type(), size_reg);
+        let pow = heap_data.memory.page_size_log2;
         self.masm.shift_ir(
-            dst.reg,
+            writable!(dst.reg),
             pow as u64,
             dst.into(),
             ShiftKind::ShrU,
-            heap_data.ty.into(),
+            heap_data.index_type().into(),
         );
         self.context.stack.push(dst.into());
+    }
+
+    /// Emit a series of instructions that check the current fuel usage by
+    /// performing a zero-comparison with the number of units stored in
+    /// `VMRuntimeLimits`.
+    pub fn emit_fuel_check(&mut self) {
+        let fuel_var = self.emit_load_fuel_consumed();
+        let continuation = self.masm.get_label();
+
+        // Spill locals and registers to avoid conflicts at the out-of-fuel
+        // control flow merge.
+        self.context.spill(self.masm);
+        // Fuel is stored as a negative i64, so if the number is less than zero,
+        // we're still under the fuel limits.
+        self.masm.branch(
+            IntCmpKind::LtS,
+            fuel_var,
+            RegImm::i64(0),
+            continuation,
+            OperandSize::S64,
+        );
+        // Out-of-fuel branch.
+        let out_of_fuel = self.env.builtins.out_of_gas::<M::ABI, M::Ptr>();
+        FnCall::emit::<M>(
+            &mut self.env,
+            self.masm,
+            &mut self.context,
+            Callee::Builtin(out_of_fuel.clone()),
+        );
+        // Under fuel limits branch.
+        self.masm.bind(continuation);
+        self.context.free_reg(fuel_var);
+    }
+
+    /// Increments the fuel consumed in `VMRuntimeLimits` by flushing
+    /// `self.fuel_consumed` to memory.
+    fn emit_fuel_increment(&mut self) {
+        let fuel_at_point = std::mem::replace(&mut self.fuel_consumed, 0);
+        if fuel_at_point == 0 {
+            return;
+        }
+
+        let limits_offset = self.env.vmoffsets.ptr.vmctx_runtime_limits();
+        let fuel_offset = self.env.vmoffsets.ptr.vmruntime_limits_fuel_consumed();
+        let limits_var = self.context.any_gpr(self.masm);
+
+        // Load `VMRuntimeLimits` into the `limits_var` reg.
+        self.masm.load_ptr(
+            self.masm.address_at_vmctx(u32::from(limits_offset)),
+            writable!(limits_var),
+        );
+
+        // Load the fuel consumed at point into the scratch register.
+        self.masm.load(
+            self.masm.address_at_reg(limits_var, u32::from(fuel_offset)),
+            writable!(scratch!(M)),
+            OperandSize::S64,
+        );
+
+        // Add the fuel consumed at point with the value in the scratch
+        // register.
+        self.masm.add(
+            writable!(scratch!(M)),
+            scratch!(M),
+            RegImm::i64(fuel_at_point),
+            OperandSize::S64,
+        );
+
+        // Store the updated fuel consumed to `VMRuntimeLimits`.
+        self.masm.store(
+            scratch!(M).into(),
+            self.masm.address_at_reg(limits_var, u32::from(fuel_offset)),
+            OperandSize::S64,
+        );
+
+        self.context.free_reg(limits_var);
+    }
+
+    /// Emits a series of instructions that load the `fuel_consumed` field from
+    /// `VMRuntimeLimits`.
+    fn emit_load_fuel_consumed(&mut self) -> Reg {
+        let limits_offset = self.env.vmoffsets.ptr.vmctx_runtime_limits();
+        let fuel_offset = self.env.vmoffsets.ptr.vmruntime_limits_fuel_consumed();
+        let fuel_var = self.context.any_gpr(self.masm);
+        self.masm.load_ptr(
+            self.masm.address_at_vmctx(u32::from(limits_offset)),
+            writable!(fuel_var),
+        );
+
+        self.masm.load(
+            self.masm.address_at_reg(fuel_var, u32::from(fuel_offset)),
+            writable!(fuel_var),
+            // Fuel is an i64.
+            OperandSize::S64,
+        );
+
+        fuel_var
+    }
+
+    /// Hook to handle fuel before visiting an operator.
+    fn fuel_before_visit_op(&mut self, op: &Operator) {
+        if !self.context.reachable {
+            // `self.fuel_consumed` must be correctly flushed to memory when
+            // entering an unreachable state.
+            debug_assert_eq!(self.fuel_consumed, 0);
+            return;
+        }
+
+        // Generally, most instructions require 1 fuel unit.
+        //
+        // However, there are exceptions, which are detailed in the code below.
+        // Note that the fuel accounting semantics align with those of
+        // Cranelift; for further information, refer to
+        // `crates/cranelift/src/func_environ.rs`.
+        //
+        // The primary distinction between the two implementations is that Winch
+        // does not utilize a local-based cache to track fuel consumption.
+        // Instead, each increase in fuel necessitates loading from and storing
+        // to memory.
+        //
+        // Memory traffic will undoubtedly impact runtime performance. One
+        // potential optimization is to designate a register as non-allocatable,
+        // when fuel consumption is enabled, effectively using it as a local
+        // fuel cache.
+        self.fuel_consumed += match op {
+            Operator::Nop | Operator::Drop => 0,
+            Operator::Block { .. }
+            | Operator::Loop { .. }
+            | Operator::Unreachable
+            | Operator::Return
+            | Operator::Else
+            | Operator::End => 0,
+            _ => 1,
+        };
+
+        match op {
+            Operator::Unreachable
+            | Operator::Loop { .. }
+            | Operator::If { .. }
+            | Operator::Else { .. }
+            | Operator::Br { .. }
+            | Operator::BrIf { .. }
+            | Operator::BrTable { .. }
+            | Operator::End
+            | Operator::Return
+            | Operator::CallIndirect { .. }
+            | Operator::Call { .. }
+            | Operator::ReturnCall { .. }
+            | Operator::ReturnCallIndirect { .. } => {
+                self.emit_fuel_increment();
+            }
+            _ => {}
+        }
+    }
+
+    // Hook to handle source location mapping before visiting an operator.
+    fn source_location_before_visit_op(&mut self, offset: usize) {
+        let loc = SourceLoc::new(offset as u32);
+        let rel = self.source_loc_from(loc);
+        self.source_location.current = self.masm.start_source_loc(rel);
+    }
+
+    // Hook to handle source location mapping after visiting an operator.
+    fn source_location_after_visit_op(&mut self) {
+        // Because in Winch binary emission is done in a single pass
+        // and because the MachBuffer performs optimizations during
+        // emission, we have to be careful when calling
+        // [`MacroAssembler::end_source_location`] to avoid breaking the
+        // invariant that checks that the end [CodeOffset] must be equal
+        // or greater than the start [CodeOffset].
+        if self.masm.current_code_offset() >= self.source_location.current.0 {
+            self.masm.end_source_loc();
+        }
     }
 }
 

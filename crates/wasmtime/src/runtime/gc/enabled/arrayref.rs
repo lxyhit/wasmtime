@@ -2,16 +2,16 @@
 
 use crate::runtime::vm::VMGcRef;
 use crate::store::StoreId;
-use crate::vm::{GcArrayLayout, GcLayout, VMArrayRef, VMGcHeader};
+use crate::vm::{VMArrayRef, VMGcHeader};
 use crate::{
     prelude::*,
     store::{AutoAssertNoGc, StoreContextMut, StoreOpaque},
-    ArrayType, AsContext, AsContextMut, GcHeapOutOfMemory, GcRefImpl, GcRootIndex, HeapType,
+    ArrayType, AsContext, AsContextMut, EqRef, GcHeapOutOfMemory, GcRefImpl, GcRootIndex, HeapType,
     ManuallyRooted, RefType, Rooted, Val, ValRaw, ValType, WasmTy,
 };
 use crate::{AnyRef, FieldType};
 use core::mem::{self, MaybeUninit};
-use wasmtime_environ::{VMGcKind, VMSharedTypeIndex};
+use wasmtime_environ::{GcArrayLayout, GcLayout, VMGcKind, VMSharedTypeIndex};
 
 /// An allocator for a particular Wasm GC array type.
 ///
@@ -206,12 +206,24 @@ impl Rooted<ArrayRef> {
     pub fn to_anyref(self) -> Rooted<AnyRef> {
         self.unchecked_cast()
     }
+
+    /// Upcast this `arrayref` into an `eqref`.
+    #[inline]
+    pub fn to_eqref(self) -> Rooted<EqRef> {
+        self.unchecked_cast()
+    }
 }
 
 impl ManuallyRooted<ArrayRef> {
     /// Upcast this `arrayref` into an `anyref`.
     #[inline]
     pub fn to_anyref(self) -> ManuallyRooted<AnyRef> {
+        self.unchecked_cast()
+    }
+
+    /// Upcast this `arrayref` into an `eqref`.
+    #[inline]
+    pub fn to_eqref(self) -> ManuallyRooted<EqRef> {
         self.unchecked_cast()
     }
 }
@@ -556,7 +568,7 @@ impl ArrayRef {
         Ok(gc_ref.as_arrayref_unchecked())
     }
 
-    fn layout(&self, store: &AutoAssertNoGc<'_>) -> Result<GcArrayLayout> {
+    pub(crate) fn layout(&self, store: &AutoAssertNoGc<'_>) -> Result<GcArrayLayout> {
         assert!(self.comes_from_same_store(&store));
         let type_index = self.type_index(store)?;
         let layout = store
@@ -682,7 +694,7 @@ impl ArrayRef {
         store: &mut AutoAssertNoGc<'_>,
         gc_ref: VMGcRef,
     ) -> Rooted<Self> {
-        debug_assert!(!gc_ref.is_i31());
+        debug_assert!(gc_ref.is_arrayref(&*store.unwrap_gc_store().gc_heap));
         Rooted::new(store, gc_ref)
     }
 }

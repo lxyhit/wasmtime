@@ -1,6 +1,6 @@
 use anyhow::Result;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use once_cell::unsync::Lazy;
+use std::cell::LazyCell;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
@@ -24,6 +24,7 @@ fn benchmark_name(strategy: &InstanceAllocationStrategy) -> &'static str {
     match strategy {
         InstanceAllocationStrategy::OnDemand => "default",
         InstanceAllocationStrategy::Pooling { .. } => "pooling",
+        _ => unreachable!(),
     }
 }
 
@@ -35,7 +36,7 @@ fn bench_sequential(c: &mut Criterion, path: &Path) {
             benchmark_name(&strategy),
             path.file_name().unwrap().to_str().unwrap(),
         );
-        let state = Lazy::new(|| {
+        let state = LazyCell::new(|| {
             let mut config = Config::default();
             config.allocation_strategy(strategy.clone());
 
@@ -70,7 +71,7 @@ fn bench_parallel(c: &mut Criterion, path: &Path) {
     let mut group = c.benchmark_group("parallel");
 
     for strategy in strategies() {
-        let state = Lazy::new(|| {
+        let state = LazyCell::new(|| {
             let mut config = Config::default();
             config.allocation_strategy(strategy.clone());
 
@@ -153,7 +154,7 @@ fn bench_deserialize_module(c: &mut Criterion, path: &Path) {
 
     let name = path.file_name().unwrap().to_str().unwrap();
     let tmpfile = tempfile::NamedTempFile::new().unwrap();
-    let state = Lazy::new(|| {
+    let state = LazyCell::new(|| {
         let engine = Engine::default();
         let module = Module::from_file(&engine, path).expect("failed to load WASI example module");
         let bytes = module.serialize().unwrap();

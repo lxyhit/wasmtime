@@ -30,6 +30,7 @@ wasmtime-component-util = { workspace = true, optional = true }
 wasmtime-slab = { workspace = true, optional = true }
 wasmtime-versioned-export-macros = { workspace = true }
 wasmtime-wmemcheck = { workspace = true, optional = true }
+pulley-interpreter = { workspace = true, optional = true }
 target-lexicon = { workspace = true }
 wasmparser = { workspace = true }
 wasm-encoder = { workspace = true, optional = true }
@@ -45,7 +46,7 @@ sptr = { workspace = true }
 postcard = { workspace = true }
 indexmap = { workspace = true }
 paste = "1.0.3"
-once_cell = { workspace = true }
+once_cell = { version = "1.12.0", optional = true }
 rayon = { version = "1.0", optional = true }
 object = { workspace = true }
 async-trait = { workspace = true, optional = true }
@@ -73,8 +74,15 @@ features = [
   "Win32_Security",
 ]
 
-[target.'cfg(all(target_arch = "x86_64", not(target_os = "android")))'.dependencies]
-ittapi = { version = "0.4.0", optional = true }
+# Allow-list the platforms that `ittapi` builds on since it's got C code that
+# doesn't compile by default on all platforms just yet. Also note that this is
+# only enabled for `x86_64` targets as well.
+[target.'cfg(all(target_arch = "x86_64", target_os = "linux"))'.dependencies]
+ittapi = { workspace = true, optional = true }
+[target.'cfg(all(target_arch = "x86_64", target_os = "macos"))'.dependencies]
+ittapi = { workspace = true, optional = true }
+[target.'cfg(all(target_arch = "x86_64", target_os = "windows"))'.dependencies]
+ittapi = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 memfd = { workspace = true, optional = true }
@@ -113,6 +121,8 @@ default = [
   'async',
   'cache',
   'gc',
+  'gc-drc',
+  'gc-null',
   'wat',
   'profiling',
   'parallel-compilation',
@@ -134,10 +144,17 @@ default = [
 # precompiled WebAssembly modules.
 cranelift = ["dep:wasmtime-cranelift", "std"]
 
-# Enables support for winch, the WebAssembly baseline compiler. The Winch compiler
+# Enables support for Winch, the WebAssembly baseline compiler. The Winch compiler
 # strategy in `Config` will be available. It is currently in active development
 # and shouldn't be used in production applications.
 winch = ["dep:wasmtime-winch", "std"]
+
+# Enables support for Pulley, the WebAssembly interpreter. When paired with the
+# `cranelift` feature, the compiler backends for the `pulley32` and `pulley64`
+# targets will be available. When paired with the `runtime` feature, the Pulley
+# interpreter will be built into the runtime and you can interpret WebAssembly
+# modules that have been compiled to Pulley bytecode.
+pulley = ["dep:pulley-interpreter", "wasmtime-cranelift?/pulley"]
 
 # Enables support for incremental compilation cache to be enabled in `Config`.
 incremental-cache = ["wasmtime-cranelift?/incremental-cache", "std"]
@@ -175,7 +192,7 @@ pooling-allocator = ["runtime", "std"]
 # Enables support for all architectures in Cranelift, allowing
 # cross-compilation using the `wasmtime` crate's API, notably the
 # `Engine::precompile_module` function.
-all-arch = ["wasmtime-cranelift?/all-arch", "wasmtime-winch?/all-arch"]
+all-arch = ["wasmtime-cranelift?/all-arch", "wasmtime-winch?/all-arch", "pulley"]
 
 # Enables in-progress support for the component model. Note that this feature is
 # in-progress, buggy, and incomplete. This is primarily here for internal
@@ -196,6 +213,9 @@ wmemcheck = [
   "wasmtime-environ/wmemcheck",
   "std",
 ]
+
+# Enables detailed internal compiler logging via WASMTIME_LOG
+trace-log = ["wasmtime-cranelift?/trace-log"]
 
 # Enables support for demangling WebAssembly function names at runtime in
 # errors such as backtraces.
@@ -221,7 +241,8 @@ runtime = [
   "dep:windows-sys",
   "dep:psm",
   "dep:rustix",
-  "rustix/mm"
+  "rustix/mm",
+  "pulley-interpreter?/interp",
 ]
 
 # Enable support for garbage collection-related things.
@@ -238,7 +259,16 @@ runtime = [
 #
 # When the `runtime` Cargo feature is enabled, this feature gates the ability to
 # load and run Wasm that uses those proposals.
+#
+# You can additionally configure which GC implementations are enabled via the
+# `gc-drc` and `gc-null` features.
 gc = ["wasmtime-environ/gc", "wasmtime-cranelift?/gc"]
+
+# Enable the deferred reference counting garbage collector.
+gc-drc = ["gc", "wasmtime-environ/gc-drc", "wasmtime-cranelift?/gc-drc"]
+
+# Enable the null garbage collector.
+gc-null = ["gc", "wasmtime-environ/gc-null", "wasmtime-cranelift?/gc-null"]
 
 # Enable runtime support for the WebAssembly threads proposal.
 threads = ["wasmtime-cranelift?/threads", "std"]
@@ -258,7 +288,7 @@ std = [
   'wasmtime-component-macro?/std',
   'wasmtime-environ/std',
   'object/std',
-  'once_cell/std',
+  'once_cell',
 ]
 
 # Enables support for the `Store::call_hook` API which enables injecting custom
@@ -269,3 +299,19 @@ call-hook = []
 # Enables support for "memory protection keys" which can be used in conjunction
 # with the pooling allocator on x64 to compact linear memory allocations.
 memory-protection-keys = ["pooling-allocator"]
+
+# Enables a re-export of wasmparser, so that an embedder of Wasmtime can use
+# exactly the version of the parser library that Wasmtime does. Sometimes this
+# is necessary, e.g. to guarantee that there will not be any mismatches in
+# which modules are accepted due to Wasm feature configuration or support
+# levels.
+#
+# Note that when this feature is enabled, the version of wasmparser that is
+# re-exported is *not subject to semver*: we reserve the right to make patch
+# releases of Wasmtime that bump the version of wasmparser used, and hence the
+# version re-exported, in semver-incompatible ways. This is the tradeoff that
+# the embedder needs to opt into: in order to stay exactly in sync with an
+# internal detail of Wasmtime, the cost is visibility into potential internal
+# version changes. This is why the re-export is guarded by a feature flag which
+# is off by default.
+reexport-wasmparser = []

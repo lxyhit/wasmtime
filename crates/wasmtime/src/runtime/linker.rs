@@ -1,4 +1,5 @@
 use crate::func::HostFunc;
+use crate::hash_map::{Entry, HashMap};
 use crate::instance::InstancePre;
 use crate::store::StoreOpaque;
 use crate::{prelude::*, IntoFunc};
@@ -13,7 +14,6 @@ use core::future::Future;
 use core::marker;
 #[cfg(feature = "async")]
 use core::pin::Pin;
-use hashbrown::hash_map::{Entry, HashMap};
 use log::warn;
 
 /// Structure used to link wasm modules/instances together.
@@ -129,7 +129,7 @@ pub(crate) enum DefinitionType {
     // information but additionally the current size of the table/memory, as
     // this is used during linking since the min size specified in the type may
     // no longer be the current size of the table/memory.
-    Table(wasmtime_environ::Table, u32),
+    Table(wasmtime_environ::Table, u64),
     Memory(wasmtime_environ::Memory, u64),
 }
 

@@ -4,13 +4,11 @@ use crate::V128;
 use core::mem;
 
 /// A plain-old-data type that can be stored in a `ValType` or a `StorageType`.
-///
-/// Safety: implementations must be POD and all bit patterns must be valid.
 pub trait PodValType<const SIZE: usize>: Copy {
-    /// Read an instance of `Self` from the given little-endian bytes.
+    /// Read an instance of `Self` from the given native-endian bytes.
     fn read_le(le_bytes: &[u8; SIZE]) -> Self;
 
-    /// Write `self` into the given memory location, as little-endian bytes.
+    /// Write `self` into the given memory location, as native-endian bytes.
     fn write_le(&self, into: &mut [u8; SIZE]);
 }
 
@@ -131,8 +129,47 @@ impl<'a> VMGcObjectDataMut<'a> {
         assert_eq!(N, mem::size_of::<T>());
         let offset = usize::try_from(offset).unwrap();
         let end = offset.checked_add(N).unwrap();
-        let into = self.data.get_mut(offset..end).expect("out of bounds field");
+        let into = match self.data.get_mut(offset..end) {
+            Some(into) => into,
+            None => panic!(
+                "out of bounds field! field range = {offset:#x}..{end:#x}; object len = {:#x}",
+                self.data.len(),
+            ),
+        };
         val.write_le(into.try_into().unwrap());
+    }
+
+    /// Get a slice of this object's data.
+    ///
+    /// Panics on out-of-bounds accesses.
+    #[inline]
+    pub fn slice(&self, offset: u32, len: u32) -> &[u8] {
+        let start = usize::try_from(offset).unwrap();
+        let len = usize::try_from(len).unwrap();
+        let end = start.checked_add(len).unwrap();
+        self.data.get(start..end).expect("out of bounds slice")
+    }
+
+    /// Get a mutable slice of this object's data.
+    ///
+    /// Panics on out-of-bounds accesses.
+    #[inline]
+    pub fn slice_mut(&mut self, offset: u32, len: u32) -> &mut [u8] {
+        let start = usize::try_from(offset).unwrap();
+        let len = usize::try_from(len).unwrap();
+        let end = start.checked_add(len).unwrap();
+        self.data.get_mut(start..end).expect("out of bounds slice")
+    }
+
+    /// Copy the given slice into this object's data at the given offset.
+    ///
+    /// Panics on out-of-bounds accesses.
+    #[inline]
+    pub fn copy_from_slice(&mut self, offset: u32, src: &[u8]) {
+        let offset = usize::try_from(offset).unwrap();
+        let end = offset.checked_add(src.len()).unwrap();
+        let into = self.data.get_mut(offset..end).expect("out of bounds copy");
+        into.copy_from_slice(src);
     }
 
     impl_pod_methods! {

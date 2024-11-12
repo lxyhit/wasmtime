@@ -14,7 +14,7 @@ pub struct PoolingAllocationConfig {
     pub total_stacks: u32,
 
     pub max_memory_size: usize,
-    pub table_elements: u32,
+    pub table_elements: usize,
 
     pub component_instance_size: usize,
     pub max_memories_per_component: u32,
@@ -69,6 +69,7 @@ impl PoolingAllocationConfig {
         cfg.async_stack_keep_resident(self.async_stack_keep_resident);
 
         cfg.memory_protection_keys(self.memory_protection_keys);
+        cfg.max_memory_protection_keys(self.max_memory_protection_keys);
 
         cfg
     }
@@ -79,7 +80,7 @@ impl<'a> Arbitrary<'a> for PoolingAllocationConfig {
         const MAX_COUNT: u32 = 100;
         const MAX_TABLES: u32 = 100;
         const MAX_MEMORIES: u32 = 100;
-        const MAX_ELEMENTS: u32 = 1000;
+        const MAX_ELEMENTS: usize = 1000;
         const MAX_MEMORY_SIZE: usize = 10 * (1 << 20); // 10 MiB
         const MAX_SIZE: usize = 1 << 20; // 1 MiB
         const MAX_INSTANCE_MEMORIES: u32 = 10;
@@ -115,7 +116,7 @@ impl<'a> Arbitrary<'a> for PoolingAllocationConfig {
             async_stack_keep_resident: u.int_in_range(0..=1 << 20)?,
 
             memory_protection_keys: *u.choose(&[MpkEnabled::Auto, MpkEnabled::Disable])?,
-            max_memory_protection_keys: u.int_in_range(0..=20)?,
+            max_memory_protection_keys: u.int_in_range(1..=20)?,
         })
     }
 }

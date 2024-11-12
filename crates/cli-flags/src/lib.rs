@@ -42,22 +42,18 @@ wasmtime_option_group! {
         /// Optimization level of generated code (0-2, s; default: 2)
         pub opt_level: Option<wasmtime::OptLevel>,
 
-        /// Byte size of the guard region after dynamic memories are allocated
-        pub dynamic_memory_guard_size: Option<u64>,
+        /// Do not allow Wasm linear memories to move in the host process's
+        /// address space.
+        pub memory_may_move: Option<bool>,
 
-        /// Force using a "static" style for all wasm memories
-        pub static_memory_forced: Option<bool>,
+        /// Initial virtual memory allocation size for memories.
+        pub memory_reservation: Option<u64>,
 
-        /// Maximum size in bytes of wasm memory before it becomes dynamically
-        /// relocatable instead of up-front-reserved.
-        pub static_memory_maximum_size: Option<u64>,
+        /// Bytes to reserve at the end of linear memory for growth into.
+        pub memory_reservation_for_growth: Option<u64>,
 
-        /// Byte size of the guard region after static memories are allocated
-        pub static_memory_guard_size: Option<u64>,
-
-        /// Bytes to reserve at the end of linear memory for growth for dynamic
-        /// memories.
-        pub dynamic_memory_reserved_for_growth: Option<u64>,
+        /// Size, in bytes, of guard pages for linear memories.
+        pub memory_guard_size: Option<u64>,
 
         /// Indicates whether an unmapped region of memory is placed before all
         /// linear memories.
@@ -74,7 +70,7 @@ wasmtime_option_group! {
 
         /// The number of decommits to do per batch. A batch size of 1
         /// effectively disables decommit batching. (default: 1)
-        pub pooling_decommit_batch_size: Option<u32>,
+        pub pooling_decommit_batch_size: Option<usize>,
 
         /// How many bytes to keep resident between instantiations for the
         /// pooling allocator in linear memories.
@@ -86,7 +82,11 @@ wasmtime_option_group! {
 
         /// Enable memory protection keys for the pooling allocator; this can
         /// optimize the size of memory slots.
-        pub memory_protection_keys: Option<bool>,
+        pub pooling_memory_protection_keys: Option<bool>,
+
+        /// Sets an upper limit on how many memory protection keys (MPK) Wasmtime
+        /// will use. (default: 16)
+        pub pooling_max_memory_protection_keys: Option<usize>,
 
         /// Configure attempting to initialize linear memory via a
         /// copy-on-write mapping (default: yes)
@@ -118,11 +118,66 @@ wasmtime_option_group! {
 
         /// The maximum table elements for any table defined in a module when
         /// using the pooling allocator.
-        pub pooling_table_elements: Option<u32>,
+        pub pooling_table_elements: Option<usize>,
 
         /// The maximum size, in bytes, allocated for a core instance's metadata
         /// when using the pooling allocator.
         pub pooling_max_core_instance_size: Option<usize>,
+
+        /// Configures the maximum number of "unused warm slots" to retain in the
+        /// pooling allocator. (default: 100)
+        pub pooling_max_unused_warm_slots: Option<u32>,
+
+        /// Configures whether or not stacks used for async futures are reset to
+        /// zero after usage. (default: false)
+        pub pooling_async_stack_zeroing: Option<bool>,
+
+        /// How much memory, in bytes, to keep resident for async stacks allocated
+        /// with the pooling allocator. (default: 0)
+        pub pooling_async_stack_keep_resident: Option<usize>,
+
+        /// The maximum size, in bytes, allocated for a component instance's
+        /// `VMComponentContext` metadata. (default: 1MiB)
+        pub pooling_max_component_instance_size: Option<usize>,
+
+        /// The maximum number of core instances a single component may contain
+        /// (default is unlimited).
+        pub pooling_max_core_instances_per_component: Option<u32>,
+
+        /// The maximum number of Wasm linear memories that a single component may
+        /// transitively contain (default is unlimited).
+        pub pooling_max_memories_per_component: Option<u32>,
+
+        /// The maximum number of tables that a single component may transitively
+        /// contain (default is unlimited).
+        pub pooling_max_tables_per_component: Option<u32>,
+
+        /// The maximum number of defined tables for a core module. (default: 1)
+        pub pooling_max_tables_per_module: Option<u32>,
+
+        /// The maximum number of defined linear memories for a module. (default: 1)
+        pub pooling_max_memories_per_module: Option<u32>,
+
+        /// The maximum number of concurrent GC heaps supported. (default: 1000)
+        pub pooling_total_gc_heaps: Option<u32>,
+
+        /// Enable or disable the use of host signal handlers for traps.
+        pub signals_based_traps: Option<bool>,
+
+        /// DEPRECATED: Use `-Cmemory-guard-size=N` instead.
+        pub dynamic_memory_guard_size: Option<u64>,
+
+        /// DEPRECATED: Use `-Cmemory-guard-size=N` instead.
+        pub static_memory_guard_size: Option<u64>,
+
+        /// DEPRECATED: Use `-Cmemory-may-move` instead.
+        pub static_memory_forced: Option<bool>,
+
+        /// DEPRECATED: Use `-Cmemory-reservation=N` instead.
+        pub static_memory_maximum_size: Option<u64>,
+
+        /// DEPRECATED: Use `-Cmemory-reservation-for-growth=N` instead.
+        pub dynamic_memory_reserved_for_growth: Option<u64>,
     }
 
     enum Optimize {
@@ -138,6 +193,16 @@ wasmtime_option_group! {
         /// Currently only `cranelift` and `winch` are supported, but not all
         /// builds of Wasmtime have both built in.
         pub compiler: Option<wasmtime::Strategy>,
+        /// Which garbage collector to use: `drc` or `null`.
+        ///
+        /// `drc` is the deferred reference-counting collector.
+        ///
+        /// `null` is the null garbage collector, which does not collect any
+        /// garbage.
+        ///
+        /// Note that not all builds of Wasmtime will have support for garbage
+        /// collection included.
+        pub collector: Option<wasmtime::Collector>,
         /// Enable Cranelift's internal debug verifier (expensive)
         pub cranelift_debug_verifier: Option<bool>,
         /// Whether or not to enable caching of compiled modules.
@@ -148,6 +213,9 @@ wasmtime_option_group! {
         pub parallel_compilation: Option<bool>,
         /// Whether to enable proof-carrying code (PCC)-based validation.
         pub pcc: Option<bool>,
+        /// Controls whether native unwind information is present in compiled
+        /// object files.
+        pub native_unwind_info: Option<bool>,
 
         #[prefixed = "cranelift"]
         /// Set a cranelift-specific option. Use `wasmtime settings` to see
@@ -199,6 +267,12 @@ wasmtime_option_group! {
         /// Maximum stack size, in bytes, that wasm is allowed to consume before a
         /// stack overflow is reported.
         pub max_wasm_stack: Option<usize>,
+        /// Stack size, in bytes, that will be allocated for async stacks.
+        ///
+        /// Note that this must be larger than `max-wasm-stack` and the
+        /// difference between the two is how much stack the host has to execute
+        /// on.
+        pub async_stack_size: Option<usize>,
         /// Allow unknown exports when running commands.
         pub unknown_exports_allow: Option<bool>,
         /// Allow the main module to import unknown functions, using an
@@ -215,7 +289,7 @@ wasmtime_option_group! {
         /// WebAssembly modules to return -1 and fail.
         pub max_memory_size: Option<usize>,
         /// Maximum size, in table elements, that a table is allowed to reach.
-        pub max_table_elements: Option<u32>,
+        pub max_table_elements: Option<usize>,
         /// Maximum number of WebAssembly instances allowed to be created.
         pub max_instances: Option<usize>,
         /// Maximum number of WebAssembly tables allowed to be created.
@@ -272,6 +346,8 @@ wasmtime_option_group! {
         pub gc: Option<bool>,
         /// Configure support for the custom-page-sizes proposal.
         pub custom_page_sizes: Option<bool>,
+        /// Configure support for the wide-arithmetic proposal.
+        pub wide_arithmetic: Option<bool>,
     }
 
     enum Wasm {
@@ -284,6 +360,8 @@ wasmtime_option_group! {
     pub struct WasiOptions {
         /// Enable support for WASI CLI APIs, including filesystems, sockets, clocks, and random.
         pub cli: Option<bool>,
+        /// Enable WASI APIs marked as: @unstable(feature = cli-exit-with-code)
+        pub cli_exit_with_code: Option<bool>,
         /// Deprecated alias for `cli`
         pub common: Option<bool>,
         /// Enable support for WASI neural network API (experimental)
@@ -292,8 +370,8 @@ wasmtime_option_group! {
         pub threads: Option<bool>,
         /// Enable support for WASI HTTP API (experimental)
         pub http: Option<bool>,
-        /// Enable support for WASI runtime config API (experimental)
-        pub runtime_config: Option<bool>,
+        /// Enable support for WASI config API (experimental)
+        pub config: Option<bool>,
         /// Enable support for WASI key-value API (experimental)
         pub keyvalue: Option<bool>,
         /// Inherit environment variables and file descriptors following the
@@ -327,14 +405,16 @@ wasmtime_option_group! {
         pub tcp: Option<bool>,
         /// Indicates whether `wasi:sockets` UDP support is enabled or not.
         pub udp: Option<bool>,
+        /// Enable WASI APIs marked as: @unstable(feature = network-error-code)
+        pub network_error_code: Option<bool>,
         /// Allows imports from the `wasi_unstable` core wasm module.
         pub preview0: Option<bool>,
         /// Inherit all environment variables from the parent process.
         ///
         /// This option can be further overwritten with `--env` flags.
         pub inherit_env: Option<bool>,
-        /// Pass a wasi runtime config variable to the program.
-        pub runtime_config_var: Vec<KeyValuePair>,
+        /// Pass a wasi config variable to the program.
+        pub config_var: Vec<KeyValuePair>,
         /// Preset data for the In-Memory provider of WASI key-value API.
         pub keyvalue_in_memory_data: Vec<KeyValuePair>,
     }
@@ -477,6 +557,11 @@ impl CommonOptions {
             _ => err,
         }
         match_feature! {
+            ["gc" : self.codegen.collector]
+            collector => config.collector(collector),
+            _ => err,
+        }
+        match_feature! {
             ["cranelift" : target]
             target => config.target(target)?,
             _ => err,
@@ -554,23 +639,36 @@ impl CommonOptions {
             true => err,
         }
 
-        if let Some(max) = self.opts.static_memory_maximum_size {
-            config.static_memory_maximum_size(max);
+        if let Some(max) = self
+            .opts
+            .memory_reservation
+            .or(self.opts.static_memory_maximum_size)
+        {
+            config.memory_reservation(max);
         }
 
         if let Some(enable) = self.opts.static_memory_forced {
-            config.static_memory_forced(enable);
+            config.memory_may_move(!enable);
+        }
+        if let Some(enable) = self.opts.memory_may_move {
+            config.memory_may_move(enable);
         }
 
-        if let Some(size) = self.opts.static_memory_guard_size {
-            config.static_memory_guard_size(size);
+        if let Some(size) = self
+            .opts
+            .static_memory_guard_size
+            .or(self.opts.dynamic_memory_guard_size)
+            .or(self.opts.memory_guard_size)
+        {
+            config.memory_guard_size(size);
         }
 
-        if let Some(size) = self.opts.dynamic_memory_guard_size {
-            config.dynamic_memory_guard_size(size);
-        }
-        if let Some(size) = self.opts.dynamic_memory_reserved_for_growth {
-            config.dynamic_memory_reserved_for_growth(size);
+        if let Some(size) = self
+            .opts
+            .memory_reservation_for_growth
+            .or(self.opts.dynamic_memory_reserved_for_growth)
+        {
+            config.memory_reservation_for_growth(size);
         }
         if let Some(enable) = self.opts.guard_before_linear_memory {
             config.guard_before_linear_memory(enable);
@@ -592,6 +690,12 @@ impl CommonOptions {
         }
         if let Some(enable) = self.opts.memory_init_cow {
             config.memory_init_cow(enable);
+        }
+        if let Some(enable) = self.opts.signals_based_traps {
+            config.signals_based_traps(enable);
+        }
+        if let Some(enable) = self.codegen.native_unwind_info {
+            config.native_unwind_info(enable);
         }
 
         match_feature! {
@@ -628,16 +732,60 @@ impl CommonOptions {
                         limit => cfg.total_stacks(limit),
                         _ => err,
                     }
-                    if let Some(limit) = self.opts.pooling_max_memory_size {
-                        cfg.max_memory_size(limit);
+                    if let Some(max) = self.opts.pooling_max_memory_size {
+                        cfg.max_memory_size(max);
+                    }
+                    if let Some(size) = self.opts.pooling_decommit_batch_size {
+                        cfg.decommit_batch_size(size);
+                    }
+                    if let Some(max) = self.opts.pooling_max_unused_warm_slots {
+                        cfg.max_unused_warm_slots(max);
                     }
                     match_feature! {
-                        ["memory-protection-keys" : self.opts.memory_protection_keys]
+                        ["async" : self.opts.pooling_async_stack_zeroing]
+                        enable => cfg.async_stack_zeroing(enable),
+                        _ => err,
+                    }
+                    match_feature! {
+                        ["async" : self.opts.pooling_async_stack_keep_resident]
+                        size => cfg.async_stack_keep_resident(size),
+                        _ => err,
+                    }
+                    if let Some(max) = self.opts.pooling_max_component_instance_size {
+                        cfg.max_component_instance_size(max);
+                    }
+                    if let Some(max) = self.opts.pooling_max_core_instances_per_component {
+                        cfg.max_core_instances_per_component(max);
+                    }
+                    if let Some(max) = self.opts.pooling_max_memories_per_component {
+                        cfg.max_memories_per_component(max);
+                    }
+                    if let Some(max) = self.opts.pooling_max_tables_per_component {
+                        cfg.max_tables_per_component(max);
+                    }
+                    if let Some(max) = self.opts.pooling_max_tables_per_module {
+                        cfg.max_tables_per_module(max);
+                    }
+                    if let Some(max) = self.opts.pooling_max_memories_per_module {
+                        cfg.max_memories_per_module(max);
+                    }
+                    match_feature! {
+                        ["memory-protection-keys" : self.opts.pooling_memory_protection_keys]
                         enable => cfg.memory_protection_keys(if enable {
                             wasmtime::MpkEnabled::Enable
                         } else {
                             wasmtime::MpkEnabled::Disable
                         }),
+                        _ => err,
+                    }
+                    match_feature! {
+                        ["memory-protection-keys" : self.opts.pooling_max_memory_protection_keys]
+                        max => cfg.max_memory_protection_keys(max),
+                        _ => err,
+                    }
+                    match_feature! {
+                        ["gc" : self.opts.pooling_total_gc_heaps]
+                        max => cfg.total_gc_heaps(max),
                         _ => err,
                     }
                     config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(cfg));
@@ -646,14 +794,37 @@ impl CommonOptions {
             true => err,
         }
 
-        if self.opts.memory_protection_keys.unwrap_or(false)
+        if self.opts.pooling_memory_protection_keys.unwrap_or(false)
             && !self.opts.pooling_allocator.unwrap_or(false)
         {
             anyhow::bail!("memory protection keys require the pooling allocator");
         }
 
+        if self.opts.pooling_max_memory_protection_keys.is_some()
+            && !self.opts.pooling_memory_protection_keys.unwrap_or(false)
+        {
+            anyhow::bail!(
+                "max memory protection keys requires memory protection keys to be enabled"
+            );
+        }
+
+        match_feature! {
+            ["async" : self.wasm.async_stack_size]
+            size => config.async_stack_size(size),
+            _ => err,
+        }
+
         if let Some(max) = self.wasm.max_wasm_stack {
             config.max_wasm_stack(max);
+
+            // If `-Wasync-stack-size` isn't passed then automatically adjust it
+            // to the wasm stack size provided here too. That prevents the need
+            // to pass both when one can generally be inferred from the other.
+            #[cfg(feature = "async")]
+            if self.wasm.async_stack_size.is_none() {
+                const DEFAULT_HOST_STACK: usize = 512 << 10;
+                config.async_stack_size(max + DEFAULT_HOST_STACK);
+            }
         }
 
         if let Some(enable) = self.wasm.relaxed_simd_deterministic {
@@ -694,6 +865,9 @@ impl CommonOptions {
         }
         if let Some(enable) = self.wasm.custom_page_sizes.or(all) {
             config.wasm_custom_page_sizes(enable);
+        }
+        if let Some(enable) = self.wasm.wide_arithmetic.or(all) {
+            config.wasm_wide_arithmetic(enable);
         }
 
         macro_rules! handle_conditionally_compiled {

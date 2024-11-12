@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use tempfile::{NamedTempFile, TempDir};
 
 // Run the wasmtime CLI with the provided args and return the `Output`.
@@ -174,10 +174,13 @@ fn run_wasmtime_unreachable_wat() -> Result<()> {
 
     assert_ne!(output.stderr, b"");
     assert_eq!(output.stdout, b"");
-    assert!(!output.status.success());
 
-    let code = output
-        .status
+    assert_trap_code(&output.status);
+    Ok(())
+}
+
+fn assert_trap_code(status: &ExitStatus) {
+    let code = status
         .code()
         .expect("wasmtime process should exit normally");
 
@@ -186,7 +189,6 @@ fn run_wasmtime_unreachable_wat() -> Result<()> {
     assert_eq!(code, 128 + libc::SIGABRT);
     #[cfg(windows)]
     assert_eq!(code, 3);
-    Ok(())
 }
 
 // Run a simple WASI hello world, snapshot0 edition.
@@ -287,11 +289,7 @@ fn exit125_wasi_snapshot0() -> Result<()> {
             None,
         )?;
         dbg!(&output);
-        if cfg!(windows) {
-            assert_eq!(output.status.code().unwrap(), 1);
-        } else {
-            assert_eq!(output.status.code().unwrap(), 125);
-        }
+        assert_eq!(output.status.code().unwrap(), 125);
     }
     Ok(())
 }
@@ -301,11 +299,7 @@ fn exit125_wasi_snapshot0() -> Result<()> {
 fn exit125_wasi_snapshot1() -> Result<()> {
     let wasm = build_wasm("tests/all/cli_tests/exit125_wasi_snapshot1.wat")?;
     let output = run_wasmtime_for_output(&["-Ccache=n", wasm.path().to_str().unwrap()], None)?;
-    if cfg!(windows) {
-        assert_eq!(output.status.code().unwrap(), 1);
-    } else {
-        assert_eq!(output.status.code().unwrap(), 125);
-    }
+    assert_eq!(output.status.code().unwrap(), 125);
     Ok(())
 }
 
@@ -926,7 +920,7 @@ fn table_growth_failure2() -> Result<()> {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("forcing a table growth failure to be a trap"),
+        stderr.contains("forcing trap when growing table to 4294967296 elements"),
         "bad stderr: {stderr}"
     );
     Ok(())
@@ -1098,6 +1092,21 @@ fn mpk_without_pooling() -> Result<()> {
     Ok(())
 }
 
+// Very basic use case: compile binary wasm file and run specific function with arguments.
+#[test]
+fn increase_stack_size() -> Result<()> {
+    run_wasmtime(&[
+        "run",
+        "--invoke",
+        "simple",
+        &format!("-Wmax-wasm-stack={}", 5 << 20),
+        "-Ccache=n",
+        "tests/all/cli_tests/simple.wat",
+        "4",
+    ])?;
+    Ok(())
+}
+
 mod test_programs {
     use super::{get_wasmtime_command, run_wasmtime};
     use anyhow::{bail, Context, Result};
@@ -1142,6 +1151,27 @@ mod test_programs {
             "is an argument",
             "with 🚩 emoji",
         ])?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_stdin_empty() -> Result<()> {
+        let mut child = get_wasmtime_command()?
+            .args(&["run", "-Wcomponent-model", CLI_STDIN_EMPTY_COMPONENT])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"not to be read")
+            .unwrap();
+        let output = child.wait_with_output()?;
+        println!("stdout: {}", String::from_utf8_lossy(&output.stdout));
+        println!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success());
         Ok(())
     }
 
@@ -1287,6 +1317,21 @@ mod test_programs {
             .output()?;
         assert!(!output.status.success());
         assert_eq!(output.status.code(), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn cli_exit_with_code() -> Result<()> {
+        let output = get_wasmtime_command()?
+            .args(&[
+                "run",
+                "-Wcomponent-model",
+                "-Scli-exit-with-code",
+                CLI_EXIT_WITH_CODE_COMPONENT,
+            ])
+            .output()?;
+        assert!(!output.status.success());
+        assert_eq!(output.status.code(), Some(42));
         Ok(())
     }
 
@@ -1880,11 +1925,11 @@ stderr [1] :: after empty
     }
 
     #[tokio::test]
-    async fn cli_serve_runtime_config() -> Result<()> {
-        let server = WasmtimeServe::new(CLI_SERVE_RUNTIME_CONFIG_COMPONENT, |cmd| {
+    async fn cli_serve_config() -> Result<()> {
+        let server = WasmtimeServe::new(CLI_SERVE_CONFIG_COMPONENT, |cmd| {
             cmd.arg("-Scli");
-            cmd.arg("-Sruntime-config");
-            cmd.arg("-Sruntime-config-var=hello=world");
+            cmd.arg("-Sconfig");
+            cmd.arg("-Sconfig-var=hello=world");
         })?;
 
         let resp = server
@@ -1902,12 +1947,12 @@ stderr [1] :: after empty
     }
 
     #[test]
-    fn cli_runtime_config() -> Result<()> {
+    fn cli_config() -> Result<()> {
         run_wasmtime(&[
             "run",
-            "-Sruntime-config",
-            "-Sruntime-config-var=hello=world",
-            RUNTIME_CONFIG_GET_COMPONENT,
+            "-Sconfig",
+            "-Sconfig-var=hello=world",
+            CONFIG_GET_COMPONENT,
         ])?;
         Ok(())
     }
@@ -1991,4 +2036,21 @@ fn profile_with_vtune() -> Result<()> {
 #[cfg(target_arch = "x86_64")]
 fn is_vtune_available() -> bool {
     Command::new("vtune").arg("-version").output().is_ok()
+}
+
+#[test]
+fn unreachable_without_wasi() -> Result<()> {
+    let output = run_wasmtime_for_output(
+        &[
+            "-Scli=n",
+            "-Ccache=n",
+            "tests/all/cli_tests/unreachable.wat",
+        ],
+        None,
+    )?;
+
+    assert_ne!(output.stderr, b"");
+    assert_eq!(output.stdout, b"");
+    assert_trap_code(&output.status);
+    Ok(())
 }

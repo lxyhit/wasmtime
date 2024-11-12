@@ -1,5 +1,7 @@
 //! Cranelift code generation library.
 #![deny(missing_docs)]
+// Display feature requirements in the documentation when building on docs.rs
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![no_std]
 // Various bits and pieces of this crate might only be used for one platform or
 // another, but it's not really too useful to learn about that all the time. On
@@ -97,7 +99,7 @@ pub mod incremental_cache;
 #[macro_export]
 macro_rules! trace {
     ($($tt:tt)*) => {
-        if cfg!(feature = "trace-log") {
+        if cfg!(any(feature = "trace-log", debug_assertions)) {
             ::log::trace!($($tt)*);
         }
     };

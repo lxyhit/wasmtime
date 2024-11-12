@@ -2,12 +2,13 @@
 //! with `bincode` as part of a module's compilation process.
 
 use crate::prelude::*;
-use crate::{DefinedFuncIndex, FilePos, FuncIndex, Module, PrimaryMap, StackMap};
+use crate::{
+    DefinedFuncIndex, FilePos, FuncIndex, Module, ModuleInternedTypeIndex, PrimaryMap, StackMap,
+};
 use core::fmt;
 use core::ops::Range;
 use core::str;
 use serde_derive::{Deserialize, Serialize};
-use wasmtime_types::ModuleInternedTypeIndex;
 
 /// Secondary in-memory results of function compilation.
 #[derive(Serialize, Deserialize)]
@@ -92,9 +93,6 @@ pub struct FunctionName {
 /// Metadata associated with a compiled ELF artifact.
 #[derive(Serialize, Deserialize)]
 pub struct Metadata {
-    /// Whether or not native debug information is available in `obj`
-    pub native_debug_info_present: bool,
-
     /// Whether or not the original wasm module contained debug information that
     /// we skipped and did not parse.
     pub has_unparsed_debuginfo: bool,
@@ -108,6 +106,10 @@ pub struct Metadata {
     /// Note that even if this flag is `true` sections may be missing if they
     /// weren't found in the original wasm module itself.
     pub has_wasm_debuginfo: bool,
+
+    /// Whether this artifact contains Pulley bytecode (instead of machine code)
+    /// or not.
+    pub is_pulley: bool,
 
     /// Dwarf sections and the offsets at which they're stored in the
     /// ELF_WASMTIME_DWARF

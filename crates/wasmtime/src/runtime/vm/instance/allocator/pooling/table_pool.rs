@@ -9,7 +9,7 @@ use crate::runtime::vm::{
 use crate::{runtime::vm::sys::vm::commit_pages, vm::round_usize_up_to_host_pages};
 use std::mem;
 use std::ptr::NonNull;
-use wasmtime_environ::{Module, TablePlan};
+use wasmtime_environ::{Module, Tunables};
 
 /// Represents a pool of WebAssembly tables.
 ///
@@ -34,7 +34,7 @@ impl TablePool {
 
         let table_size = round_up_to_pow2(
             mem::size_of::<*mut u8>()
-                .checked_mul(config.limits.table_elements as usize)
+                .checked_mul(config.limits.table_elements)
                 .ok_or_else(|| anyhow!("table size exceeds addressable memory"))?,
             page_size,
         );
@@ -63,7 +63,7 @@ impl TablePool {
 
     /// Validate whether this module's tables are allocatable by this pool.
     pub fn validate(&self, module: &Module) -> Result<()> {
-        let tables = module.table_plans.len() - module.num_imported_tables;
+        let tables = module.num_defined_tables();
 
         if tables > usize::try_from(self.tables_per_instance).unwrap() {
             bail!(
@@ -81,12 +81,12 @@ impl TablePool {
             );
         }
 
-        for (i, plan) in module.table_plans.iter().skip(module.num_imported_tables) {
-            if plan.table.minimum > u32::try_from(self.table_elements).unwrap() {
+        for (i, table) in module.tables.iter().skip(module.num_imported_tables) {
+            if table.limits.min > u64::try_from(self.table_elements)? {
                 bail!(
                     "table index {} has a minimum element size of {} which exceeds the limit of {}",
                     i.as_u32(),
-                    plan.table.minimum,
+                    table.limits.min,
                     self.table_elements,
                 );
             }
@@ -116,7 +116,8 @@ impl TablePool {
     pub fn allocate(
         &self,
         request: &mut InstanceAllocationRequest,
-        table_plan: &TablePlan,
+        ty: &wasmtime_environ::Table,
+        tunables: &Tunables,
     ) -> Result<(TableAllocationIndex, Table)> {
         let allocation_index = self
             .index_allocator
@@ -130,10 +131,7 @@ impl TablePool {
             let base = self.get(allocation_index);
 
             unsafe {
-                commit_pages(
-                    base as *mut u8,
-                    self.table_elements * mem::size_of::<*mut u8>(),
-                )?;
+                commit_pages(base, self.table_elements * mem::size_of::<*mut u8>())?;
             }
 
             let ptr = NonNull::new(std::ptr::slice_from_raw_parts_mut(
@@ -143,7 +141,8 @@ impl TablePool {
             .unwrap();
             unsafe {
                 Table::new_static(
-                    table_plan,
+                    ty,
+                    tunables,
                     SendSyncPtr::new(ptr),
                     &mut *request.store.get().unwrap(),
                 )
@@ -192,10 +191,7 @@ impl TablePool {
         assert!(table.is_static());
         let base = self.get(allocation_index);
 
-        let size = round_up_to_pow2(
-            table.size() as usize * mem::size_of::<*mut u8>(),
-            self.page_size,
-        );
+        let size = round_up_to_pow2(table.size() * mem::size_of::<*mut u8>(), self.page_size);
 
         // `memset` the first `keep_resident` bytes.
         let size_to_memset = size.min(self.keep_resident);

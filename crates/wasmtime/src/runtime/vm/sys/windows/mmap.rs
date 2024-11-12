@@ -19,7 +19,7 @@ pub struct Mmap {
 impl Mmap {
     pub fn new_empty() -> Mmap {
         Mmap {
-            memory: SendSyncPtr::from(&mut [][..]),
+            memory: crate::vm::sys::empty_mmap(),
             is_file: false,
         }
     }
@@ -86,14 +86,14 @@ impl Mmap {
             // WRITECOPY part is needed for possibly resolving relocations,
             // but otherwise writes don't happen.
             let mapping = CreateFileMappingW(
-                file.as_raw_handle() as isize,
+                file.as_raw_handle(),
                 ptr::null_mut(),
                 PAGE_EXECUTE_WRITECOPY,
                 0,
                 0,
                 ptr::null(),
             );
-            if mapping == 0 {
+            if mapping == INVALID_HANDLE_VALUE {
                 return Err(io::Error::last_os_error().into_anyhow())
                     .context("failed to create file mapping");
             }
@@ -118,7 +118,7 @@ impl Mmap {
 
             let memory = std::ptr::slice_from_raw_parts_mut(ptr.cast(), len);
             let memory = SendSyncPtr::new(NonNull::new(memory).unwrap());
-            let mut ret = Self {
+            let ret = Self {
                 memory,
                 is_file: true,
             };
@@ -158,13 +158,13 @@ impl Mmap {
     }
 
     #[inline]
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+    pub fn as_mut_ptr(&self) -> *mut u8 {
         self.memory.as_ptr().cast()
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        unsafe { (*self.memory.as_ptr()).len() }
+        self.memory.as_ptr().len()
     }
 
     pub unsafe fn make_executable(
