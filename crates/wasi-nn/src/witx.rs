@@ -91,7 +91,7 @@ where
 }
 
 /// Generate the traits and types from the `wasi-nn` WITX specification.
-mod generated {
+pub mod generated {
     use super::*;
     wiggle::from_witx!({
         witx: ["$WASI_ROOT/wasi-nn.witx"],
