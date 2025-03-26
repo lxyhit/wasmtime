@@ -16,12 +16,9 @@ impl WasmiEngine {
         // Force generated Wasm modules to never have features that Wasmi doesn't support.
         config.simd_enabled = false;
         config.relaxed_simd_enabled = false;
-        config.memory64_enabled = false;
         config.threads_enabled = false;
         config.exceptions_enabled = false;
         config.gc_enabled = false;
-        config.custom_page_sizes_enabled = false;
-        config.wide_arithmetic_enabled = false;
 
         let mut wasmi_config = wasmi::Config::default();
         wasmi_config
@@ -35,7 +32,10 @@ impl WasmiEngine {
             .wasm_reference_types(config.reference_types_enabled)
             .wasm_tail_call(config.tail_call_enabled)
             .wasm_multi_memory(config.max_memories > 1)
-            .wasm_extended_const(true);
+            .wasm_extended_const(config.extended_const_enabled)
+            .wasm_custom_page_sizes(config.custom_page_sizes_enabled)
+            .wasm_memory64(config.memory64_enabled)
+            .wasm_wide_arithmetic(config.wide_arithmetic_enabled);
         Self {
             engine: wasmi::Engine::new(&wasmi_config),
         }
@@ -78,14 +78,14 @@ impl DiffEngine for WasmiEngine {
         Ok(Box::new(WasmiInstance { store, instance }))
     }
 
-    fn assert_error_match(&self, trap: &Trap, err: &Error) {
-        match self.trap_code(err) {
-            Some(code) => assert_eq!(wasmi_to_wasmtime_trap_code(code), *trap),
-            None => panic!("unexpected wasmi error {err:?}"),
+    fn assert_error_match(&self, lhs: &Error, rhs: &Trap) {
+        match self.trap_code(lhs) {
+            Some(code) => assert_eq!(wasmi_to_wasmtime_trap_code(code), *rhs),
+            None => panic!("unexpected wasmi error {lhs:?}"),
         }
     }
 
-    fn is_stack_overflow(&self, err: &Error) -> bool {
+    fn is_non_deterministic_error(&self, err: &Error) -> bool {
         matches!(
             self.trap_code(err),
             Some(wasmi::core::TrapCode::StackOverflow)

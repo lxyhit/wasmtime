@@ -52,7 +52,7 @@ unsafe impl Send for Options {}
 unsafe impl Sync for Options {}
 
 impl Options {
-    // TODO: prevent a ctor where the memory is memory64
+    // FIXME(#4311): prevent a ctor where the memory is memory64
 
     /// Creates a new set of options with the specified components.
     ///
@@ -89,10 +89,10 @@ impl Options {
         let realloc = self.realloc.unwrap();
 
         let params = (
-            u32::try_from(old).err2anyhow()?,
-            u32::try_from(old_size).err2anyhow()?,
+            u32::try_from(old)?,
+            u32::try_from(old_size)?,
             old_align,
-            u32::try_from(new_size).err2anyhow()?,
+            u32::try_from(new_size)?,
         );
 
         type ReallocFunc = crate::TypedFunc<(u32, u32, u32, u32), u32>;
@@ -108,7 +108,7 @@ impl Options {
         if result % old_align != 0 {
             bail!("realloc return: result not aligned");
         }
-        let result = usize::try_from(result).err2anyhow()?;
+        let result = usize::try_from(result)?;
 
         let memory = self.memory_mut(store.0);
 
@@ -138,7 +138,7 @@ impl Options {
         // is an optional configuration in canonical ABI options.
         unsafe {
             let memory = self.memory.unwrap().as_ref();
-            core::slice::from_raw_parts(memory.base, memory.current_length())
+            core::slice::from_raw_parts(memory.base.as_ptr(), memory.current_length())
         }
     }
 
@@ -149,7 +149,7 @@ impl Options {
         // See comments in `memory` about the unsafety
         unsafe {
             let memory = self.memory.unwrap().as_ref();
-            core::slice::from_raw_parts_mut(memory.base, memory.current_length())
+            core::slice::from_raw_parts_mut(memory.base.as_ptr(), memory.current_length())
         }
     }
 
@@ -206,7 +206,7 @@ impl<'a, T> LowerContext<'a, T> {
     /// # Unsafety
     ///
     /// This function is unsafe as it needs to be guaranteed by the caller that
-    /// the `instance` here is is valid within `store` and is a valid component
+    /// the `instance` here is valid within `store` and is a valid component
     /// instance.
     pub unsafe fn new(
         store: StoreContextMut<'a, T>,

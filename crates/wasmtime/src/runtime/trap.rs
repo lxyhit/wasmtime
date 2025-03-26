@@ -68,13 +68,6 @@ use wasmtime_environ::{demangle_function_name, demangle_function_name_or_index, 
 /// ```
 pub use wasmtime_environ::Trap;
 
-// Same safety requirements and caveats as
-// `crate::runtime::vm::raise_user_trap`.
-pub(crate) unsafe fn raise(error: anyhow::Error) -> ! {
-    let needs_backtrace = error.downcast_ref::<WasmBacktrace>().is_none();
-    crate::runtime::vm::raise_user_trap(error, needs_backtrace)
-}
-
 #[cold] // traps are exceptional, this helps move handling off the main path
 pub(crate) fn from_runtime_box(
     store: &mut StoreOpaque,
@@ -99,21 +92,13 @@ pub(crate) fn from_runtime_box(
         // provide useful information to debug with for the embedder/caller,
         // otherwise the information about what the wasm was doing when the
         // error was generated would be lost.
-        crate::runtime::vm::TrapReason::User {
-            error,
-            needs_backtrace,
-        } => {
-            debug_assert!(
-                needs_backtrace == backtrace.is_some() || !store.engine().config().wasm_backtrace
-            );
-            (error, None)
-        }
+        crate::runtime::vm::TrapReason::User(error) => (error, None),
         crate::runtime::vm::TrapReason::Jit {
             pc,
             faulting_addr,
             trap,
         } => {
-            let mut err: Error = trap.into_anyhow();
+            let mut err: Error = trap.into();
 
             // If a fault address was present, for example with segfaults,
             // then simultaneously assert that it's within a known linear memory
@@ -124,7 +109,7 @@ pub(crate) fn from_runtime_box(
             }
             (err, Some(pc))
         }
-        crate::runtime::vm::TrapReason::Wasm(trap_code) => (trap_code.into_anyhow(), None),
+        crate::runtime::vm::TrapReason::Wasm(trap_code) => (trap_code.into(), None),
     };
 
     if let Some(bt) = backtrace {
@@ -272,11 +257,7 @@ impl WasmBacktrace {
     /// always captures a backtrace.
     pub fn force_capture(store: impl AsContext) -> WasmBacktrace {
         let store = store.as_context();
-        Self::from_captured(
-            store.0,
-            crate::runtime::vm::Backtrace::new(store.0.runtime_limits()),
-            None,
-        )
+        Self::from_captured(store.0, crate::runtime::vm::Backtrace::new(store.0), None)
     }
 
     fn from_captured(
@@ -442,8 +423,7 @@ impl FrameInfo {
     pub(crate) fn new(module: Module, text_offset: usize) -> Option<FrameInfo> {
         let compiled_module = module.compiled_module();
         let (index, _func_offset) = compiled_module.func_by_text_offset(text_offset)?;
-        let info = compiled_module.wasm_func_info(index);
-        let func_start = info.start_srcloc;
+        let func_start = compiled_module.func_start_srcloc(index);
         let instr = wasmtime_environ::lookup_file_pos(
             compiled_module.code_memory().address_map_data(),
             text_offset,

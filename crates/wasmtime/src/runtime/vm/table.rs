@@ -7,6 +7,8 @@
 use crate::prelude::*;
 use crate::runtime::vm::vmcontext::{VMFuncRef, VMTableDefinition};
 use crate::runtime::vm::{GcStore, SendSyncPtr, VMGcRef, VMStore};
+use core::alloc::Layout;
+use core::mem;
 use core::ops::Range;
 use core::ptr::{self, NonNull};
 use core::slice;
@@ -22,7 +24,7 @@ use wasmtime_environ::{
 /// `ptr::null_mut`.
 pub enum TableElement {
     /// A `funcref`.
-    FuncRef(*mut VMFuncRef),
+    FuncRef(Option<NonNull<VMFuncRef>>),
 
     /// A GC reference.
     GcRef(Option<VMGcRef>),
@@ -67,7 +69,7 @@ impl TableElement {
     /// # Safety
     ///
     /// The same warnings as for `into_table_values()` apply.
-    pub(crate) unsafe fn into_func_ref_asserting_initialized(self) -> *mut VMFuncRef {
+    pub(crate) unsafe fn into_func_ref_asserting_initialized(self) -> Option<NonNull<VMFuncRef>> {
         match self {
             Self::FuncRef(e) => e,
             Self::UninitFunc => panic!("Uninitialized table element value outside of table slot"),
@@ -85,8 +87,8 @@ impl TableElement {
     }
 }
 
-impl From<*mut VMFuncRef> for TableElement {
-    fn from(f: *mut VMFuncRef) -> TableElement {
+impl From<Option<NonNull<VMFuncRef>>> for TableElement {
+    fn from(f: Option<NonNull<VMFuncRef>>) -> TableElement {
         TableElement::FuncRef(f)
     }
 }
@@ -112,7 +114,8 @@ impl TaggedFuncRef {
 
     /// Converts the given `ptr`, a valid funcref pointer, into a tagged pointer
     /// by adding in the `FUNCREF_INIT_BIT`.
-    fn from(ptr: *mut VMFuncRef, lazy_init: bool) -> Self {
+    fn from(ptr: Option<NonNull<VMFuncRef>>, lazy_init: bool) -> Self {
+        let ptr = ptr.map(|p| p.as_ptr()).unwrap_or(ptr::null_mut());
         if lazy_init {
             let masked = Strict::map_addr(ptr, |a| a | FUNCREF_INIT_BIT);
             TaggedFuncRef(masked)
@@ -131,7 +134,7 @@ impl TaggedFuncRef {
             // Masking off the tag bit is harmless whether the table uses lazy
             // init or not.
             let unmasked = Strict::map_addr(ptr, |a| a & FUNCREF_MASK);
-            TableElement::FuncRef(unmasked)
+            TableElement::FuncRef(NonNull::new(unmasked))
         }
     }
 }
@@ -262,7 +265,47 @@ fn wasm_to_table_type(ty: WasmRefType) -> TableElementType {
     match ty.heap_type.top() {
         WasmHeapTopType::Func => TableElementType::Func,
         WasmHeapTopType::Any | WasmHeapTopType::Extern => TableElementType::GcRef,
+        WasmHeapTopType::Cont => todo!(), // FIXME: #10248 stack switching support.
     }
+}
+
+/// Allocate dynamic table elements of the given length.
+///
+/// Relies on the fact that our tables' elements are initialized to `None`,
+/// which is represented by zero, to allocate pre-zeroed memory from the global
+/// allocator and avoid manual zero-initialization.
+///
+/// # Safety
+///
+/// Should only ever be called with a `T` that is a table element type and where
+/// `Option<T>`'s `None` variant is represented with zero.
+unsafe fn alloc_dynamic_table_elements<T>(len: usize) -> Result<Vec<Option<T>>> {
+    debug_assert!(
+        core::mem::MaybeUninit::<Option<T>>::zeroed()
+            .assume_init()
+            .is_none(),
+        "null table elements are represented with zeroed memory"
+    );
+
+    if len == 0 {
+        return Ok(vec![]);
+    }
+
+    let align = mem::align_of::<Option<T>>();
+
+    let size = mem::size_of::<Option<T>>();
+    let size = size.next_multiple_of(align);
+    let size = size.checked_mul(len).unwrap();
+
+    let layout = Layout::from_size_align(size, align)?;
+
+    let ptr = alloc::alloc::alloc_zeroed(layout);
+    ensure!(!ptr.is_null(), "failed to allocate memory for table");
+
+    let elems = Vec::<Option<T>>::from_raw_parts(ptr.cast(), len, len);
+    debug_assert!(elems.iter().all(|e| e.is_none()));
+
+    Ok(elems)
 }
 
 impl Table {
@@ -275,12 +318,12 @@ impl Table {
         let (minimum, maximum) = Self::limit_new(ty, store)?;
         match wasm_to_table_type(ty.ref_type) {
             TableElementType::Func => Ok(Self::from(DynamicFuncTable {
-                elements: vec![None; minimum],
+                elements: unsafe { alloc_dynamic_table_elements(minimum)? },
                 maximum,
                 lazy_init: tunables.table_lazy_init,
             })),
             TableElementType::GcRef => Ok(Self::from(DynamicGcRefTable {
-                elements: (0..minimum).map(|_| None).collect(),
+                elements: unsafe { alloc_dynamic_table_elements(minimum)? },
                 maximum,
             })),
         }
@@ -442,7 +485,7 @@ impl Table {
     pub fn init_func(
         &mut self,
         dst: u64,
-        items: impl ExactSizeIterator<Item = *mut VMFuncRef>,
+        items: impl ExactSizeIterator<Item = Option<NonNull<VMFuncRef>>>,
     ) -> Result<(), Trap> {
         let dst = usize::try_from(dst).map_err(|_| Trap::TableOutOfBounds)?;
 
@@ -567,7 +610,7 @@ impl Table {
         if delta == 0 {
             return Ok(Some(old_size));
         }
-        // Cannot return `Trap::TableOutOfBounds` here becase `impl std::error::Error for Trap` is not available in no-std.
+        // Cannot return `Trap::TableOutOfBounds` here because `impl std::error::Error for Trap` is not available in no-std.
         let delta =
             usize::try_from(delta).map_err(|_| format_err!("delta exceeds host pointer size"))?;
 
@@ -739,25 +782,29 @@ impl Table {
         match self {
             Table::Static(StaticTable::Func(StaticFuncTable { data, size, .. })) => {
                 VMTableDefinition {
-                    base: data.as_ptr().cast(),
+                    base: data.cast().into(),
                     current_elements: *size,
                 }
             }
             Table::Static(StaticTable::GcRef(StaticGcRefTable { data, size })) => {
                 VMTableDefinition {
-                    base: data.as_ptr().cast(),
+                    base: data.cast().into(),
                     current_elements: *size,
                 }
             }
             Table::Dynamic(DynamicTable::Func(DynamicFuncTable { elements, .. })) => {
                 VMTableDefinition {
-                    base: elements.as_mut_ptr().cast(),
+                    base: NonNull::<[FuncTableElem]>::from(&mut elements[..])
+                        .cast()
+                        .into(),
                     current_elements: elements.len(),
                 }
             }
             Table::Dynamic(DynamicTable::GcRef(DynamicGcRefTable { elements, .. })) => {
                 VMTableDefinition {
-                    base: elements.as_mut_ptr().cast(),
+                    base: NonNull::<[Option<VMGcRef>]>::from(&mut elements[..])
+                        .cast()
+                        .into(),
                     current_elements: elements.len(),
                 }
             }

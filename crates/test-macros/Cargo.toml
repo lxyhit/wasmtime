@@ -17,7 +17,8 @@ doctest = false
 workspace = true
 
 [dependencies]
-quote = "1.0"
-proc-macro2 = "1.0"
+quote = { workspace = true }
+proc-macro2 = { workspace = true }
 syn = { workspace = true, features = ["full"] }
 anyhow = { workspace = true }
+wasmtime-test-util = { workspace = true, features = ['wast'] }

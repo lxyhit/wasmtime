@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, reason = "lots of macro-generated code")]
 
 macro_rules! gentest {
     ($id:ident $name:tt $path:tt) => {
@@ -10,6 +10,14 @@ macro_rules! gentest {
                 wasmtime::component::bindgen!({
                     path: $path,
                     async: true,
+                });
+            }
+            mod concurrent {
+                wasmtime::component::bindgen!({
+                    path: $path,
+                    async: true,
+                    concurrent_imports: true,
+                    concurrent_exports: true,
                 });
             }
             mod tracing {
@@ -134,7 +142,6 @@ mod trappable_errors_with_versioned_and_unversioned_packages {
         },
     });
 
-    #[allow(dead_code)]
     type MyX = u64;
 }
 
@@ -176,7 +183,6 @@ mod trappable_errors {
         },
     });
 
-    #[allow(dead_code)]
     type MyX = u32;
 }
 

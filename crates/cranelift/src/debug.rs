@@ -3,7 +3,11 @@
 // FIXME: this whole crate opts-in to these two noisier-than-default lints, but
 // this module has lots of hits on this warning which aren't the easiest to
 // resolve. Ideally all warnings would be resolved here though.
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#![expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "haven't had a chance to fix these yet"
+)]
 
 use crate::CompiledFunctionMetadata;
 use core::fmt;
@@ -143,7 +147,7 @@ impl<'a> Compilation<'a> {
     /// compilation.
     ///
     /// Each function is additionally accompanied with its module index.
-    fn indexes(&self) -> impl Iterator<Item = (StaticModuleIndex, DefinedFuncIndex)> + '_ {
+    fn indexes(&self) -> impl Iterator<Item = (StaticModuleIndex, DefinedFuncIndex)> + use<'_> {
         self.translations
             .iter()
             .flat_map(|(i, t)| t.module.defined_func_indices().map(move |j| (i, j)))

@@ -21,7 +21,7 @@ mod stacks;
 
 use self::diff_wasmtime::WasmtimeInstance;
 use self::engine::{DiffEngine, DiffInstance};
-use crate::generators::{self, DiffValue, DiffValueType};
+use crate::generators::{self, CompilerStrategy, DiffValue, DiffValueType};
 use crate::single_module_fuzzer::KnownValid;
 use arbitrary::Arbitrary;
 pub use stacks::check_stacks;
@@ -70,43 +70,57 @@ pub struct StoreLimits(Arc<LimitsState>);
 struct LimitsState {
     /// Remaining memory, in bytes, left to allocate
     remaining_memory: AtomicUsize,
-    /// Remaining times memories/tables can be grown
-    remaining_growths: AtomicUsize,
+    /// Remaining amount of memory that's allowed to be copied via a growth.
+    remaining_copy_allowance: AtomicUsize,
     /// Whether or not an allocation request has been denied
     oom: AtomicBool,
 }
+
+/// Allow up to 1G which is well below the 2G limit on OSS-Fuzz and should allow
+/// most interesting behavior.
+const MAX_MEMORY: usize = 1 << 30;
+
+/// Allow up to 4G of bytes to be copied (conservatively) which should enable
+/// growth up to `MAX_MEMORY` or at least up to a relatively large amount.
+const MAX_MEMORY_MOVED: usize = 4 << 30;
 
 impl StoreLimits {
     /// Creates the default set of limits for all fuzzing stores.
     pub fn new() -> StoreLimits {
         StoreLimits(Arc::new(LimitsState {
-            // Limits tables/memories within a store to at most 1gb for now to
-            // exercise some larger address but not overflow various limits.
-            remaining_memory: AtomicUsize::new(1 << 30),
-            // Also limit the number of times a memory or table may be grown.
-            // Otherwise infinite growths can exhibit quadratic behavior. For
-            // example Wasmtime could be configured with dynamic memories and no
-            // guard regions to grow into, meaning each memory growth could be a
-            // `memcpy`. As more data is added over time growths get more and
-            // more expensive meaning that fuel may not be effective at limiting
-            // execution time.
-            remaining_growths: AtomicUsize::new(1000),
+            remaining_memory: AtomicUsize::new(MAX_MEMORY),
+            remaining_copy_allowance: AtomicUsize::new(MAX_MEMORY_MOVED),
             oom: AtomicBool::new(false),
         }))
     }
 
     fn alloc(&mut self, amt: usize) -> bool {
         log::trace!("alloc {amt:#x} bytes");
+
+        // Assume that on each allocation of memory that all previous
+        // allocations of memory are moved. This is pretty coarse but is used to
+        // help prevent against fuzz test cases that just move tons of bytes
+        // around continuously. This assumes that all previous memory was
+        // allocated in a single linear memory and growing by `amt` will require
+        // moving all the bytes to a new location. This isn't actually required
+        // all the time nor does it accurately reflect what happens all the
+        // time, but it's a coarse approximation that should be "good enough"
+        // for allowing interesting fuzz behaviors to happen while not timing
+        // out just copying bytes around.
+        let prev_size = MAX_MEMORY - self.0.remaining_memory.load(SeqCst);
         if self
             .0
-            .remaining_growths
-            .fetch_update(SeqCst, SeqCst, |remaining| remaining.checked_sub(1))
+            .remaining_copy_allowance
+            .fetch_update(SeqCst, SeqCst, |remaining| remaining.checked_sub(prev_size))
             .is_err()
         {
             self.0.oom.store(true, SeqCst);
-            log::debug!("too many growths, rejecting allocation");
+            log::debug!("-> too many bytes moved, rejecting allocation");
             return false;
         }
+
+        // If we're allowed to move the bytes, then also check if we're allowed
+        // to actually have this much residence at once.
         match self
             .0
             .remaining_memory
@@ -115,7 +129,7 @@ impl StoreLimits {
             Ok(_) => true,
             Err(_) => {
                 self.0.oom.store(true, SeqCst);
-                log::debug!("OOM hit");
+                log::debug!("-> OOM hit");
                 false
             }
         }
@@ -232,13 +246,27 @@ pub fn instantiate_many(
     config: &generators::Config,
     commands: &[Command],
 ) {
+    log::debug!("instantiate_many: {commands:#?}");
+
     assert!(!config.module_config.config.allow_start_export);
 
     let engine = Engine::new(&config.to_wasmtime()).unwrap();
 
     let modules = modules
         .iter()
-        .filter_map(|bytes| compile_module(&engine, bytes, known_valid, config))
+        .enumerate()
+        .filter_map(
+            |(i, bytes)| match compile_module(&engine, bytes, known_valid, config) {
+                Some(m) => {
+                    log::debug!("successfully compiled module {i}");
+                    Some(m)
+                }
+                None => {
+                    log::debug!("failed to compile module {i}");
+                    None
+                }
+            },
+        )
         .collect::<Vec<_>>();
 
     // If no modules were valid, we're done
@@ -355,8 +383,11 @@ pub fn instantiate_with_dummy(store: &mut Store<StoreLimits>, module: &Module) -
     // Creation of imports can fail due to resource limit constraints, and then
     // instantiation can naturally fail for a number of reasons as well. Bundle
     // the two steps together to match on the error below.
-    let instance =
-        dummy::dummy_linker(store, module).and_then(|l| l.instantiate(&mut *store, module));
+    let linker = dummy::dummy_linker(store, module);
+    if let Err(e) = &linker {
+        log::warn!("failed to create dummy linker: {e:?}");
+    }
+    let instance = linker.and_then(|l| l.instantiate(&mut *store, module));
     unwrap_instance(store, instance)
 }
 
@@ -369,33 +400,32 @@ fn unwrap_instance(
         Err(e) => e,
     };
 
+    log::debug!("failed to instantiate: {e:?}");
+
     // If the instantiation hit OOM for some reason then that's ok, it's
     // expected that fuzz-generated programs try to allocate lots of
     // stuff.
     if store.data().is_oom() {
-        log::debug!("failed to instantiate: OOM");
         return None;
     }
 
     // Allow traps which can happen normally with `unreachable` or a
     // timeout or such
-    if let Some(trap) = e.downcast_ref::<Trap>() {
-        log::debug!("failed to instantiate: {}", trap);
+    if e.is::<Trap>() {
         return None;
     }
 
     let string = e.to_string();
+
     // Currently we instantiate with a `Linker` which can't instantiate
     // every single module under the sun due to using name-based resolution
     // rather than positional-based resolution
     if string.contains("incompatible import type") {
-        log::debug!("failed to instantiate: {}", string);
         return None;
     }
 
     // Also allow failures to instantiate as a result of hitting pooling limits.
     if e.is::<wasmtime::PoolConcurrencyLimitError>() {
-        log::debug!("failed to instantiate: {}", string);
         return None;
     }
 
@@ -429,13 +459,13 @@ pub fn differential(
         // execution by returning success.
         Ok(None) => return Ok(true),
     };
-    log::debug!(" -> results on {}: {:?}", lhs.name(), &lhs_results);
+    log::debug!(" -> lhs results on {}: {:?}", lhs.name(), &lhs_results);
 
     let rhs_results = rhs
         .evaluate(name, args, result_tys)
         // wasmtime should be able to invoke any signature, so unwrap this result
         .map(|results| results.unwrap());
-    log::debug!(" -> results on {}: {:?}", rhs.name(), &rhs_results);
+    log::debug!(" -> rhs results on {}: {:?}", rhs.name(), &rhs_results);
 
     // If Wasmtime hit its OOM condition, which is possible since it's set
     // somewhat low while fuzzing, then don't return an error but return
@@ -493,6 +523,32 @@ pub enum DiffEqResult<T, U> {
     Failed,
 }
 
+fn wasmtime_trap_is_non_deterministic(trap: &Trap) -> bool {
+    match trap {
+        // Allocations being too large for the GC are
+        // implementation-defined.
+        Trap::AllocationTooLarge |
+        // Stack size, and therefore when overflow happens, is
+        // implementation-defined.
+        Trap::StackOverflow => true,
+        _ => false,
+    }
+}
+
+fn wasmtime_error_is_non_deterministic(error: &wasmtime::Error) -> bool {
+    match error.downcast_ref::<Trap>() {
+        Some(trap) => wasmtime_trap_is_non_deterministic(trap),
+
+        // For general, unknown errors, we can't rely on this being
+        // a deterministic Wasm failure that both engines handled
+        // identically, leaving Wasm in identical states. We could
+        // just as easily be hitting engine-specific failures, like
+        // different implementation-defined limits. So simply poison
+        // this execution and move on to the next test.
+        None => true,
+    }
+}
+
 impl<T, U> DiffEqResult<T, U> {
     /// Computes the differential result from executing in two different
     /// engines.
@@ -504,41 +560,37 @@ impl<T, U> DiffEqResult<T, U> {
         match (lhs_result, rhs_result) {
             (Ok(lhs_result), Ok(rhs_result)) => DiffEqResult::Success(lhs_result, rhs_result),
 
-            // Both sides failed. Check that the trap and state at the time of
-            // failure is the same, when possible.
+            // Handle all non-deterministic errors by poisoning this execution's
+            // state, so that we simply move on to the next test.
+            (Err(lhs), _) if lhs_engine.is_non_deterministic_error(&lhs) => {
+                log::debug!("lhs failed non-deterministically: {lhs:?}");
+                DiffEqResult::Poisoned
+            }
+            (_, Err(rhs)) if wasmtime_error_is_non_deterministic(&rhs) => {
+                log::debug!("rhs failed non-deterministically: {rhs:?}");
+                DiffEqResult::Poisoned
+            }
+
+            // Both sides failed deterministically. Check that the trap and
+            // state at the time of failure is the same.
             (Err(lhs), Err(rhs)) => {
-                let err = match rhs.downcast::<Trap>() {
-                    Ok(trap) => trap,
+                let rhs = rhs
+                    .downcast::<Trap>()
+                    .expect("non-traps handled in earlier match arm");
 
-                    // For general, unknown errors, we can't rely on this being
-                    // a deterministic Wasm failure that both engines handled
-                    // identically, leaving Wasm in identical states. We could
-                    // just as easily be hitting engine-specific failures, like
-                    // different implementation-defined limits. So simply report
-                    // failure and move on to the next test.
-                    Err(err) => {
-                        log::debug!("rhs failed: {err:?}");
-                        return DiffEqResult::Failed;
-                    }
-                };
+                debug_assert!(
+                    !lhs_engine.is_non_deterministic_error(&lhs),
+                    "non-deterministic traps handled in earlier match arm",
+                );
+                debug_assert!(
+                    !wasmtime_trap_is_non_deterministic(&rhs),
+                    "non-deterministic traps handled in earlier match arm",
+                );
 
-                // Even some traps are nondeterministic, and we can't rely on
-                // the errors matching or leaving Wasm in the same state.
-                let poisoned =
-                    // Allocations being too large for the GC are
-                    // implementation-defined.
-                    err == Trap::AllocationTooLarge
-                    // Stack size, and therefore when overflow happens, is
-                    // implementation-defined.
-                    || err == Trap::StackOverflow
-                    || lhs_engine.is_stack_overflow(&lhs);
-                if poisoned {
-                    return DiffEqResult::Poisoned;
-                }
-
-                lhs_engine.assert_error_match(&err, &lhs);
+                lhs_engine.assert_error_match(&lhs, &rhs);
                 DiffEqResult::Failed
             }
+
             // A real bug is found if only one side fails.
             (Ok(_), Err(err)) => panic!("only the `rhs` failed for this input: {err:?}"),
             (Err(err), Ok(_)) => panic!("only the `lhs` failed for this input: {err:?}"),
@@ -640,34 +692,65 @@ pub fn make_api_calls(api: generators::api::ApiCalls) {
 /// Executes the wast `test` with the `config` specified.
 ///
 /// Ensures that wast tests pass regardless of the `Config`.
-pub fn wast_test(mut fuzz_config: generators::Config, test: generators::WastTest) {
+pub fn wast_test(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<()> {
     crate::init_fuzzing();
+
+    let mut fuzz_config: generators::Config = u.arbitrary()?;
+    let test: generators::WastTest = u.arbitrary()?;
+    if u.arbitrary()? {
+        fuzz_config.enable_async(u)?;
+    }
+
     let test = &test.test;
 
     // Discard tests that allocate a lot of memory as we don't want to OOM the
     // fuzzer and we also limit memory growth which would cause the test to
     // fail.
     if test.config.hogs_memory.unwrap_or(false) {
-        return;
+        return Err(arbitrary::Error::IncorrectFormat);
     }
 
     // Transform `fuzz_config` to be valid for `test` and make sure that this
     // test is supposed to pass.
     let wast_config = fuzz_config.make_wast_test_compliant(test);
     if test.should_fail(&wast_config) {
-        return;
+        return Err(arbitrary::Error::IncorrectFormat);
+    }
+
+    // Winch requires AVX and AVX2 for SIMD tests to pass so don't run the test
+    // if either isn't enabled.
+    if fuzz_config.wasmtime.compiler_strategy == CompilerStrategy::Winch
+        && test.config.simd()
+        && (fuzz_config
+            .wasmtime
+            .codegen_flag("has_avx")
+            .is_some_and(|value| value == "false")
+            || fuzz_config
+                .wasmtime
+                .codegen_flag("has_avx2")
+                .is_some_and(|value| value == "false"))
+    {
+        log::warn!(
+            "Skipping Wast test because Winch doesn't support SIMD tests with AVX or AVX2 disabled"
+        );
+        return Err(arbitrary::Error::IncorrectFormat);
     }
 
     // Fuel and epochs don't play well with threads right now, so exclude any
     // thread-spawning test if it looks like threads are spawned in that case.
     if fuzz_config.wasmtime.consume_fuel || fuzz_config.wasmtime.epoch_interruption {
         if test.contents.contains("(thread") {
-            return;
+            return Err(arbitrary::Error::IncorrectFormat);
         }
     }
 
     log::debug!("running {:?}", test.path);
-    let mut wast_context = WastContext::new(fuzz_config.to_store());
+    let async_ = if fuzz_config.wasmtime.async_config == generators::AsyncConfig::Disabled {
+        wasmtime_wast::Async::No
+    } else {
+        wasmtime_wast::Async::Yes
+    };
+    let mut wast_context = WastContext::new(fuzz_config.to_store(), async_);
     wast_context
         .register_spectest(&wasmtime_wast::SpectestConfig {
             use_shared_memory: true,
@@ -677,6 +760,7 @@ pub fn wast_test(mut fuzz_config: generators::Config, test: generators::WastTest
     wast_context
         .run_buffer(test.path.to_str().unwrap(), test.contents.as_bytes())
         .unwrap();
+    Ok(())
 }
 
 /// Execute a series of `table.get` and `table.set` operations.
@@ -921,9 +1005,11 @@ impl Drop for HelperThread {
 /// arbitrary types and values.
 pub fn dynamic_component_api_target(input: &mut arbitrary::Unstructured) -> arbitrary::Result<()> {
     use crate::generators::component_types;
-    use component_fuzz_util::{TestCase, Type, EXPORT_FUNCTION, IMPORT_FUNCTION, MAX_TYPE_DEPTH};
-    use component_test_util::FuncExt;
     use wasmtime::component::{Component, Linker, Val};
+    use wasmtime_test_util::component::FuncExt;
+    use wasmtime_test_util::component_fuzz::{
+        TestCase, Type, EXPORT_FUNCTION, IMPORT_FUNCTION, MAX_TYPE_DEPTH,
+    };
 
     crate::init_fuzzing();
 
@@ -936,21 +1022,20 @@ pub fn dynamic_component_api_target(input: &mut arbitrary::Unstructured) -> arbi
     let params = (0..input.int_in_range(0..=5)?)
         .map(|_| input.choose(&types))
         .collect::<arbitrary::Result<Vec<_>>>()?;
-    let results = (0..input.int_in_range(0..=5)?)
-        .map(|_| input.choose(&types))
-        .collect::<arbitrary::Result<Vec<_>>>()?;
+    let result = if input.arbitrary()? {
+        Some(input.choose(&types)?)
+    } else {
+        None
+    };
 
     let case = TestCase {
         params,
-        results,
+        result,
         encoding1: input.arbitrary()?,
         encoding2: input.arbitrary()?,
     };
 
-    let mut config = component_test_util::config();
-    if case.results.len() > 1 {
-        config.wasm_component_model_multiple_returns(true);
-    }
+    let mut config = wasmtime_test_util::component::config();
     config.debug_adapter_modules(input.arbitrary()?);
     let engine = Engine::new(&config).unwrap();
     let mut store = Store::new(&engine, (Vec::new(), None));
@@ -988,7 +1073,7 @@ pub fn dynamic_component_api_target(input: &mut arbitrary::Unstructured) -> arbi
     while input.arbitrary()? {
         let params = param_tys
             .iter()
-            .map(|ty| component_types::arbitrary_val(ty, input))
+            .map(|(_, ty)| component_types::arbitrary_val(ty, input))
             .collect::<arbitrary::Result<Vec<_>>>()?;
         let results = result_tys
             .iter()
@@ -1222,7 +1307,7 @@ mod tests {
     ) -> bool {
         let mut rng = SmallRng::seed_from_u64(0);
         let mut buf = vec![0; 2048];
-        let n = 2000;
+        let n = 3000;
         for _ in 0..n {
             rng.fill_bytes(&mut buf);
             let mut u = Unstructured::new(&buf);
@@ -1234,6 +1319,22 @@ mod tests {
             }
         }
         false
+    }
+
+    /// Runs `f` with random data until it returns `Ok(())` `iters` times.
+    fn test_n_times<T: for<'a> Arbitrary<'a>>(
+        iters: u32,
+        mut f: impl FnMut(T, &mut Unstructured<'_>) -> arbitrary::Result<()>,
+    ) {
+        let mut to_test = 0..iters;
+        let ok = gen_until_pass(|a, b| {
+            if f(a, b).is_ok() {
+                Ok(to_test.next().is_none())
+            } else {
+                Ok(false)
+            }
+        });
+        assert!(ok);
     }
 
     // Test that the `table_ops` fuzzer eventually runs the gc function in the host.
@@ -1276,8 +1377,11 @@ mod tests {
             | WasmFeatures::TAIL_CALL
             | WasmFeatures::WIDE_ARITHMETIC
             | WasmFeatures::MEMORY64
+            | WasmFeatures::FUNCTION_REFERENCES
+            | WasmFeatures::GC
             | WasmFeatures::GC_TYPES
-            | WasmFeatures::CUSTOM_PAGE_SIZES;
+            | WasmFeatures::CUSTOM_PAGE_SIZES
+            | WasmFeatures::EXTENDED_CONST;
 
         // All other features that wasmparser supports, which is presumably a
         // superset of the features that wasm-smith supports, are listed here as
@@ -1319,5 +1423,10 @@ mod tests {
         if !ok {
             panic!("never generated wasm module using {expected:?}");
         }
+    }
+
+    #[test]
+    fn wast_smoke_test() {
+        test_n_times(50, |(), u| super::wast_test(u));
     }
 }

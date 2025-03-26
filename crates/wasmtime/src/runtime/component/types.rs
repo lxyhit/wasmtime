@@ -145,6 +145,9 @@ impl TypeChecker<'_> {
             (InterfaceType::String, _) => false,
             (InterfaceType::Char, InterfaceType::Char) => true,
             (InterfaceType::Char, _) => false,
+            (InterfaceType::Future(_), _)
+            | (InterfaceType::Stream(_), _)
+            | (InterfaceType::ErrorContext(_), _) => todo!(),
         }
     }
 
@@ -660,6 +663,9 @@ impl Type {
             InterfaceType::Flags(index) => Type::Flags(Flags::from(*index, instance)),
             InterfaceType::Own(index) => Type::Own(instance.resource_type(*index)),
             InterfaceType::Borrow(index) => Type::Borrow(instance.resource_type(*index)),
+            InterfaceType::Future(_)
+            | InterfaceType::Stream(_)
+            | InterfaceType::ErrorContext(_) => todo!(),
         }
     }
 
@@ -701,13 +707,14 @@ impl ComponentFunc {
         Self(Handle::new(index, ty))
     }
 
-    /// Iterates over types of function parameters
-    pub fn params(&self) -> impl ExactSizeIterator<Item = Type> + '_ {
-        let params = self.0.types[self.0.index].params;
-        self.0.types[params]
+    /// Iterates over types of function parameters and names.
+    pub fn params(&self) -> impl ExactSizeIterator<Item = (&str, Type)> + '_ {
+        let ty = &self.0.types[self.0.index];
+        self.0.types[ty.params]
             .types
             .iter()
-            .map(|ty| Type::from(ty, &self.0.instance()))
+            .zip(&ty.param_names)
+            .map(|(ty, name)| (name.as_str(), Type::from(ty, &self.0.instance())))
     }
 
     /// Iterates over types of function results

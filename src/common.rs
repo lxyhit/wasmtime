@@ -3,7 +3,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use std::net::TcpListener;
-use std::{path::Path, time::Duration};
+use std::{fs::File, path::Path, time::Duration};
 use wasmtime::{Engine, Module, Precompiled, StoreLimits, StoreLimitsBuilder};
 use wasmtime_cli_flags::{opt::WasmtimeOptionValue, CommonOptions};
 use wasmtime_wasi::bindings::LinkOptions;
@@ -38,7 +38,7 @@ impl RunTarget {
 }
 
 /// Common command line arguments for run commands.
-#[derive(Parser, PartialEq)]
+#[derive(Parser)]
 pub struct RunCommon {
     #[command(flatten)]
     pub common: CommonOptions,
@@ -160,6 +160,8 @@ impl RunCommon {
             Some("-") => "/dev/stdin".as_ref(),
             _ => path,
         };
+        let file =
+            File::open(path).with_context(|| format!("failed to open wasm module {path:?}"))?;
 
         // First attempt to load the module as an mmap. If this succeeds then
         // detection can be done with the contents of the mmap and if a
@@ -179,7 +181,7 @@ impl RunCommon {
         // which isn't ready to happen at this time). It's hoped though that
         // opening a file twice isn't too bad in the grand scheme of things with
         // respect to the CLI.
-        match wasmtime::_internal::MmapVec::from_file(path) {
+        match wasmtime::_internal::MmapVec::from_file(file) {
             Ok(map) => self.load_module_contents(
                 engine,
                 path,
@@ -211,7 +213,7 @@ impl RunCommon {
         deserialize_module: impl FnOnce() -> Result<Module>,
         #[cfg(feature = "component-model")] deserialize_component: impl FnOnce() -> Result<Component>,
     ) -> Result<RunTarget> {
-        Ok(match engine.detect_precompiled(bytes) {
+        Ok(match Engine::detect_precompiled(bytes) {
             Some(Precompiled::Module) => {
                 self.ensure_allow_precompiled()?;
                 RunTarget::Core(deserialize_module()?)
@@ -250,7 +252,7 @@ impl RunCommon {
 
             #[cfg(not(any(feature = "cranelift", feature = "winch")))]
             None => {
-                let _ = path;
+                let _ = (path, engine);
                 bail!("support for compiling modules was disabled at compile time");
             }
         })
@@ -356,6 +358,7 @@ impl Profile {
             ["perfmap"] => Ok(Profile::Native(wasmtime::ProfilingStrategy::PerfMap)),
             ["jitdump"] => Ok(Profile::Native(wasmtime::ProfilingStrategy::JitDump)),
             ["vtune"] => Ok(Profile::Native(wasmtime::ProfilingStrategy::VTune)),
+            ["pulley"] => Ok(Profile::Native(wasmtime::ProfilingStrategy::Pulley)),
             ["guest"] => Ok(Profile::Guest {
                 path: "wasmtime-guest-profile.json".to_string(),
                 interval: Duration::from_millis(10),

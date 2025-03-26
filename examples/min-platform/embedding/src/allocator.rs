@@ -63,24 +63,23 @@ unsafe impl GlobalAlloc for MyGlobalDmalloc {
     }
 }
 
-// Hand-copied from `crates/wasmtime/src/runtime/vm/sys/custom/capi.rs`.
-const PROT_READ: u32 = 1 << 0;
-const PROT_WRITE: u32 = 1 << 1;
-extern "C" {
-    fn wasmtime_mmap_new(size: usize, prot_flags: u32, ret: &mut *mut u8) -> i32;
-    fn wasmtime_page_size() -> usize;
-    fn wasmtime_munmap(ptr: *mut u8, size: usize) -> i32;
-}
+#[cfg(not(feature = "wasi"))]
+const INITIAL_HEAP_SIZE: usize = 64 * 1024;
+// The wasi component requires a larger heap than the module tests
+#[cfg(feature = "wasi")]
+const INITIAL_HEAP_SIZE: usize = 4 * 1024 * 1024;
+
+static mut INITIAL_HEAP: [u8; INITIAL_HEAP_SIZE] = [0; INITIAL_HEAP_SIZE];
+static mut INITIAL_HEAP_ALLOCATED: bool = false;
 
 unsafe impl dlmalloc::Allocator for MyAllocator {
-    fn alloc(&self, size: usize) -> (*mut u8, usize, u32) {
+    fn alloc(&self, _size: usize) -> (*mut u8, usize, u32) {
         unsafe {
-            let mut ptr = ptr::null_mut();
-            let rc = wasmtime_mmap_new(size, PROT_READ | PROT_WRITE, &mut ptr);
-            if rc != 0 {
+            if INITIAL_HEAP_ALLOCATED {
                 (ptr::null_mut(), 0, 0)
             } else {
-                (ptr, size, 0)
+                INITIAL_HEAP_ALLOCATED = true;
+                ((&raw mut INITIAL_HEAP).cast(), INITIAL_HEAP_SIZE, 0)
             }
         }
     }
@@ -93,11 +92,8 @@ unsafe impl dlmalloc::Allocator for MyAllocator {
         false
     }
 
-    fn free(&self, ptr: *mut u8, size: usize) -> bool {
-        unsafe {
-            wasmtime_munmap(ptr, size);
-            true
-        }
+    fn free(&self, _ptr: *mut u8, _size: usize) -> bool {
+        false
     }
 
     fn can_release_part(&self, _flags: u32) -> bool {
@@ -109,7 +105,7 @@ unsafe impl dlmalloc::Allocator for MyAllocator {
     }
 
     fn page_size(&self) -> usize {
-        unsafe { wasmtime_page_size() }
+        4096
     }
 }
 

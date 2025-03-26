@@ -8,7 +8,6 @@ pub enum CodegenSettings {
     /// Use the host's feature set.
     Native,
     /// Generate a modified flag set for the current host.
-    #[allow(dead_code)]
     Target {
         /// The target triple of the host.
         target: String,
@@ -19,23 +18,33 @@ pub enum CodegenSettings {
 
 impl CodegenSettings {
     /// Configure Wasmtime with these codegen settings.
-    pub fn configure(&self, config: &mut wasmtime::Config) {
+    pub fn configure(&self, config: &mut wasmtime_cli_flags::CommonOptions) {
         match self {
             CodegenSettings::Native => {}
             CodegenSettings::Target { target, flags } => {
-                config.target(target).unwrap();
+                config.target = Some(target.to_string());
                 for (key, value) in flags {
-                    unsafe {
-                        config.cranelift_flag_set(key, value);
-                    }
+                    config
+                        .codegen
+                        .cranelift
+                        .push((key.clone(), Some(value.clone())));
                 }
             }
+        }
+    }
+
+    /// Returns the flags used for codegen.
+    pub(crate) fn flags(&self) -> &[(String, String)] {
+        if let Self::Target { flags, .. } = self {
+            flags
+        } else {
+            &[]
         }
     }
 }
 
 impl<'a> Arbitrary<'a> for CodegenSettings {
-    #[allow(unused_macros, unused_variables)]
+    #[expect(unused_variables, reason = "macro-generated code")]
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
         // Helper macro to enable clif features based on what the native host
         // supports. If the input says to enable a feature and the host doesn't

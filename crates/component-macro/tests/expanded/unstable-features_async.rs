@@ -62,15 +62,14 @@ impl LinkOptions {
     }
 }
 pub enum Baz {}
-#[wasmtime::component::__internal::async_trait]
-pub trait HostBaz {
+#[wasmtime::component::__internal::trait_variant_make(::core::marker::Send)]
+pub trait HostBaz: Sized {
     async fn foo(&mut self, self_: wasmtime::component::Resource<Baz>) -> ();
     async fn drop(
         &mut self,
         rep: wasmtime::component::Resource<Baz>,
     ) -> wasmtime::Result<()>;
 }
-#[wasmtime::component::__internal::async_trait]
 impl<_T: HostBaz + ?Sized + Send> HostBaz for &mut _T {
     async fn foo(&mut self, self_: wasmtime::component::Resource<Baz>) -> () {
         HostBaz::foo(*self, self_).await
@@ -82,12 +81,12 @@ impl<_T: HostBaz + ?Sized + Send> HostBaz for &mut _T {
         HostBaz::drop(*self, rep).await
     }
 }
-impl std::convert::From<LinkOptions> for foo::foo::the_interface::LinkOptions {
+impl core::convert::From<LinkOptions> for foo::foo::the_interface::LinkOptions {
     fn from(src: LinkOptions) -> Self {
         (&src).into()
     }
 }
-impl std::convert::From<&LinkOptions> for foo::foo::the_interface::LinkOptions {
+impl core::convert::From<&LinkOptions> for foo::foo::the_interface::LinkOptions {
     fn from(src: &LinkOptions) -> Self {
         let mut dest = Self::default();
         dest.experimental_interface(src.experimental_interface);
@@ -196,23 +195,23 @@ pub struct TheWorldIndices {}
 /// [`Component`]: wasmtime::component::Component
 /// [`Linker`]: wasmtime::component::Linker
 pub struct TheWorld {}
-#[wasmtime::component::__internal::async_trait]
+#[wasmtime::component::__internal::trait_variant_make(::core::marker::Send)]
 pub trait TheWorldImports: Send + HostBaz {
     async fn foo(&mut self) -> ();
 }
 pub trait TheWorldImportsGetHost<
     T,
->: Fn(T) -> <Self as TheWorldImportsGetHost<T>>::Host + Send + Sync + Copy + 'static {
+    D,
+>: Fn(T) -> <Self as TheWorldImportsGetHost<T, D>>::Host + Send + Sync + Copy + 'static {
     type Host: TheWorldImports;
 }
-impl<F, T, O> TheWorldImportsGetHost<T> for F
+impl<F, T, D, O> TheWorldImportsGetHost<T, D> for F
 where
     F: Fn(T) -> O + Send + Sync + Copy + 'static,
     O: TheWorldImports,
 {
     type Host = O;
 }
-#[wasmtime::component::__internal::async_trait]
 impl<_T: TheWorldImports + ?Sized + Send> TheWorldImports for &mut _T {
     async fn foo(&mut self) -> () {
         TheWorldImports::foo(*self).await
@@ -284,10 +283,13 @@ const _: () = {
             let indices = TheWorldIndices::new_instance(&mut store, instance)?;
             indices.load(store, instance)
         }
-        pub fn add_to_linker_imports_get_host<T>(
+        pub fn add_to_linker_imports_get_host<
+            T,
+            G: for<'a> TheWorldImportsGetHost<&'a mut T, T, Host: TheWorldImports>,
+        >(
             linker: &mut wasmtime::component::Linker<T>,
             options: &LinkOptions,
-            host_getter: impl for<'a> TheWorldImportsGetHost<&'a mut T>,
+            host_getter: G,
         ) -> wasmtime::Result<()>
         where
             T: Send,
@@ -300,7 +302,7 @@ const _: () = {
                             "baz",
                             wasmtime::component::ResourceType::host::<Baz>(),
                             move |mut store, rep| {
-                                std::boxed::Box::new(async move {
+                                wasmtime::component::__internal::Box::new(async move {
                                     HostBaz::drop(
                                             &mut host_getter(store.data_mut()),
                                             wasmtime::component::Resource::new_own(rep),
@@ -370,7 +372,7 @@ pub mod foo {
         #[allow(clippy::all)]
         pub mod the_interface {
             #[allow(unused_imports)]
-            use wasmtime::component::__internal::anyhow;
+            use wasmtime::component::__internal::{anyhow, Box};
             /// Link-time configurations.
             #[derive(Clone, Debug, Default)]
             pub struct LinkOptions {
@@ -411,15 +413,14 @@ pub mod foo {
                 }
             }
             pub enum Bar {}
-            #[wasmtime::component::__internal::async_trait]
-            pub trait HostBar {
+            #[wasmtime::component::__internal::trait_variant_make(::core::marker::Send)]
+            pub trait HostBar: Sized {
                 async fn foo(&mut self, self_: wasmtime::component::Resource<Bar>) -> ();
                 async fn drop(
                     &mut self,
                     rep: wasmtime::component::Resource<Bar>,
                 ) -> wasmtime::Result<()>;
             }
-            #[wasmtime::component::__internal::async_trait]
             impl<_T: HostBar + ?Sized + Send> HostBar for &mut _T {
                 async fn foo(
                     &mut self,
@@ -434,26 +435,30 @@ pub mod foo {
                     HostBar::drop(*self, rep).await
                 }
             }
-            #[wasmtime::component::__internal::async_trait]
-            pub trait Host: Send + HostBar {
+            #[wasmtime::component::__internal::trait_variant_make(::core::marker::Send)]
+            pub trait Host: Send + HostBar + Sized {
                 async fn foo(&mut self) -> ();
             }
             pub trait GetHost<
                 T,
-            >: Fn(T) -> <Self as GetHost<T>>::Host + Send + Sync + Copy + 'static {
+                D,
+            >: Fn(T) -> <Self as GetHost<T, D>>::Host + Send + Sync + Copy + 'static {
                 type Host: Host + Send;
             }
-            impl<F, T, O> GetHost<T> for F
+            impl<F, T, D, O> GetHost<T, D> for F
             where
                 F: Fn(T) -> O + Send + Sync + Copy + 'static,
                 O: Host + Send,
             {
                 type Host = O;
             }
-            pub fn add_to_linker_get_host<T>(
+            pub fn add_to_linker_get_host<
+                T,
+                G: for<'a> GetHost<&'a mut T, T, Host: Host + Send>,
+            >(
                 linker: &mut wasmtime::component::Linker<T>,
                 options: &LinkOptions,
-                host_getter: impl for<'a> GetHost<&'a mut T>,
+                host_getter: G,
             ) -> wasmtime::Result<()>
             where
                 T: Send,
@@ -465,7 +470,7 @@ pub mod foo {
                             "bar",
                             wasmtime::component::ResourceType::host::<Bar>(),
                             move |mut store, rep| {
-                                std::boxed::Box::new(async move {
+                                wasmtime::component::__internal::Box::new(async move {
                                     HostBar::drop(
                                             &mut host_getter(store.data_mut()),
                                             wasmtime::component::Resource::new_own(rep),
@@ -516,7 +521,6 @@ pub mod foo {
             {
                 add_to_linker_get_host(linker, options, get)
             }
-            #[wasmtime::component::__internal::async_trait]
             impl<_T: Host + ?Sized + Send> Host for &mut _T {
                 async fn foo(&mut self) -> () {
                     Host::foo(*self).await

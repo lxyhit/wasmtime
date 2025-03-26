@@ -5,7 +5,7 @@ use crate::prelude::*;
 use crate::{obj, Tunables};
 use crate::{
     BuiltinFunctionIndex, DefinedFuncIndex, FlagValue, FuncIndex, FunctionLoc, ObjectKind,
-    PrimaryMap, StaticModuleIndex, WasmError, WasmFuncType, WasmFunctionInfo,
+    PrimaryMap, StaticModuleIndex, TripleExt, WasmError, WasmFuncType,
 };
 use anyhow::Result;
 use object::write::{Object, SymbolId};
@@ -20,12 +20,14 @@ mod address_map;
 mod module_artifacts;
 mod module_environ;
 mod module_types;
+mod stack_maps;
 mod trap_encoding;
 
 pub use self::address_map::*;
 pub use self::module_artifacts::*;
 pub use self::module_environ::*;
 pub use self::module_types::*;
+pub use self::stack_maps::*;
 pub use self::trap_encoding::*;
 
 /// An error while compiling WebAssembly to machine code.
@@ -59,8 +61,7 @@ impl From<WasmError> for CompileError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for CompileError {
+impl core::error::Error for CompileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             CompileError::Wasm(e) => Some(e),
@@ -80,6 +81,8 @@ pub enum RelocationTarget {
     Builtin(BuiltinFunctionIndex),
     /// A compiler-generated libcall.
     HostLibcall(obj::LibCall),
+    /// A pulley->host call from the interpreter.
+    PulleyHostcall(u32),
 }
 
 /// Implementation of an incremental compilation's key/value cache store.
@@ -195,7 +198,7 @@ pub trait Compiler: Send + Sync {
         index: DefinedFuncIndex,
         data: FunctionBodyData<'_>,
         types: &ModuleTypesBuilder,
-    ) -> Result<(WasmFunctionInfo, Box<dyn Any + Send>), CompileError>;
+    ) -> Result<Box<dyn Any + Send>, CompileError>;
 
     /// Compile a trampoline for an array-call host function caller calling the
     /// `index`th Wasm function.
@@ -219,7 +222,7 @@ pub trait Compiler: Send + Sync {
         wasm_func_ty: &WasmFuncType,
     ) -> Result<Box<dyn Any + Send>, CompileError>;
 
-    /// Creates a tramopline that can be used to call Wasmtime's implementation
+    /// Creates a trampoline that can be used to call Wasmtime's implementation
     /// of the builtin function specified by `index`.
     ///
     /// The trampoline created can technically have any ABI but currently has
@@ -284,23 +287,29 @@ pub trait Compiler: Send + Sync {
         use target_lexicon::Architecture::*;
 
         let triple = self.triple();
+        let (arch, flags) = match triple.architecture {
+            X86_32(_) => (Architecture::I386, 0),
+            X86_64 => (Architecture::X86_64, 0),
+            Arm(_) => (Architecture::Arm, 0),
+            Aarch64(_) => (Architecture::Aarch64, 0),
+            S390x => (Architecture::S390x, 0),
+            Riscv64(_) => (Architecture::Riscv64, 0),
+            // XXX: the `object` crate won't successfully build an object
+            // with relocations and such if it doesn't know the
+            // architecture, so just pretend we are riscv64. Yolo!
+            //
+            // Also note that we add some flags to `e_flags` in the object file
+            // to indicate that it's pulley, not actually riscv64. This is used
+            // by `wasmtime objdump` for example.
+            Pulley32 | Pulley32be => (Architecture::Riscv64, obj::EF_WASMTIME_PULLEY32),
+            Pulley64 | Pulley64be => (Architecture::Riscv64, obj::EF_WASMTIME_PULLEY64),
+            architecture => {
+                anyhow::bail!("target architecture {:?} is unsupported", architecture,);
+            }
+        };
         let mut obj = Object::new(
             BinaryFormat::Elf,
-            match triple.architecture {
-                X86_32(_) => Architecture::I386,
-                X86_64 => Architecture::X86_64,
-                Arm(_) => Architecture::Arm,
-                Aarch64(_) => Architecture::Aarch64,
-                S390x => Architecture::S390x,
-                Riscv64(_) => Architecture::Riscv64,
-                // XXX: the `object` crate won't successfully build an object
-                // with relocations and such if it doesn't know the
-                // architecture, so just pretend we are riscv64. Yolo!
-                Pulley32 | Pulley64 => Architecture::Riscv64,
-                architecture => {
-                    anyhow::bail!("target architecture {:?} is unsupported", architecture,);
-                }
-            },
+            arch,
             match triple.endianness().unwrap() {
                 target_lexicon::Endianness::Little => object::Endianness::Little,
                 target_lexicon::Endianness::Big => object::Endianness::Big,
@@ -308,10 +317,11 @@ pub trait Compiler: Send + Sync {
         );
         obj.flags = FileFlags::Elf {
             os_abi: obj::ELFOSABI_WASMTIME,
-            e_flags: match kind {
-                ObjectKind::Module => obj::EF_WASMTIME_MODULE,
-                ObjectKind::Component => obj::EF_WASMTIME_COMPONENT,
-            },
+            e_flags: flags
+                | match kind {
+                    ObjectKind::Module => obj::EF_WASMTIME_MODULE,
+                    ObjectKind::Component => obj::EF_WASMTIME_COMPONENT,
+                },
             abi_version: 0,
         };
         Ok(obj)
@@ -325,13 +335,19 @@ pub trait Compiler: Send + Sync {
     /// alignment is larger than necessary for some platforms since it may
     /// depend on the platform's runtime configuration.
     fn page_size_align(&self) -> u64 {
+        // Conservatively assume the max-of-all-supported-hosts for pulley
+        // and round up to 64k.
+        if self.triple().is_pulley() {
+            return 0x10000;
+        }
+
         use target_lexicon::*;
         match (self.triple().operating_system, self.triple().architecture) {
             (
                 OperatingSystem::MacOSX { .. }
-                | OperatingSystem::Darwin
-                | OperatingSystem::Ios
-                | OperatingSystem::Tvos,
+                | OperatingSystem::Darwin(_)
+                | OperatingSystem::IOS(_)
+                | OperatingSystem::TvOS(_),
                 Architecture::Aarch64(..),
             ) => 0x4000,
             // 64 KB is the maximal page size (i.e. memory translation granule size)

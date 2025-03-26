@@ -1,5 +1,4 @@
 use super::ref_types_module;
-use super::skip_pooling_allocator_tests;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::Arc;
 use wasmtime::*;
@@ -81,6 +80,14 @@ fn smoke_test_gc_impl(use_epochs: bool) -> Result<()> {
     Ok(())
 }
 
+struct CountDrops(Arc<AtomicUsize>);
+
+impl Drop for CountDrops {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, SeqCst);
+    }
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn wasm_dropping_refs() -> Result<()> {
@@ -116,14 +123,6 @@ fn wasm_dropping_refs() -> Result<()> {
     assert_eq!(num_refs_dropped.load(SeqCst), 4096);
 
     return Ok(());
-
-    struct CountDrops(Arc<AtomicUsize>);
-
-    impl Drop for CountDrops {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, SeqCst);
-        }
-    }
 }
 
 #[test]
@@ -280,11 +279,9 @@ fn global_drops_externref() -> Result<()> {
     let _ = env_logger::try_init();
     test_engine(&Engine::default())?;
 
-    if !skip_pooling_allocator_tests() {
-        test_engine(&Engine::new(
-            Config::new().allocation_strategy(InstanceAllocationStrategy::pooling()),
-        )?)?;
-    }
+    let mut config = Config::new();
+    config.allocation_strategy(crate::small_pool_config());
+    test_engine(&Engine::new(&config)?)?;
 
     return Ok(());
 
@@ -331,11 +328,9 @@ fn table_drops_externref() -> Result<()> {
     let _ = env_logger::try_init();
     test_engine(&Engine::default())?;
 
-    if !skip_pooling_allocator_tests() {
-        test_engine(&Engine::new(
-            Config::new().allocation_strategy(InstanceAllocationStrategy::pooling()),
-        )?)?;
-    }
+    let mut config = Config::new();
+    config.allocation_strategy(crate::small_pool_config());
+    test_engine(&Engine::new(&config)?)?;
 
     return Ok(());
 
@@ -880,5 +875,357 @@ fn table_copy_doesnt_leak() -> Result<()> {
 
     store.gc();
     assert!(flag.load(SeqCst));
+    Ok(())
+}
+
+#[test]
+fn ref_matches() -> Result<()> {
+    let mut store = Store::<()>::default();
+    let engine = store.engine().clone();
+
+    let func_ty = FuncType::new(&engine, None, None);
+    let func_ref_ty = RefType::new(true, HeapType::ConcreteFunc(func_ty.clone()));
+    let f = Func::new(&mut store, func_ty, |_, _, _| Ok(()));
+
+    let pre = StructRefPre::new(&mut store, StructType::new(&engine, [])?);
+    let s = StructRef::new(&mut store, &pre, &[])?.to_anyref();
+
+    let pre = ArrayRefPre::new(
+        &mut store,
+        ArrayType::new(&engine, FieldType::new(Mutability::Const, StorageType::I8)),
+    );
+    let a = ArrayRef::new(&mut store, &pre, &Val::I32(0), 0)?.to_anyref();
+
+    let i31 = AnyRef::from_i31(&mut store, I31::wrapping_i32(1234));
+
+    let e = ExternRef::new(&mut store, "hello")?;
+
+    for (val, ty, expected) in [
+        // nulls to nullexternref
+        (Ref::Extern(None), RefType::NULLEXTERNREF, true),
+        (Ref::Any(None), RefType::NULLEXTERNREF, false),
+        (Ref::Func(None), RefType::NULLEXTERNREF, false),
+        // nulls to externref
+        (Ref::Extern(None), RefType::EXTERNREF, true),
+        (Ref::Any(None), RefType::EXTERNREF, false),
+        (Ref::Func(None), RefType::EXTERNREF, false),
+        // nulls to nullref
+        (Ref::Extern(None), RefType::NULLREF, false),
+        (Ref::Any(None), RefType::NULLREF, true),
+        (Ref::Func(None), RefType::NULLREF, false),
+        // nulls to structref
+        (Ref::Extern(None), RefType::STRUCTREF, false),
+        (Ref::Any(None), RefType::STRUCTREF, true),
+        (Ref::Func(None), RefType::STRUCTREF, false),
+        // nulls to arrayref
+        (Ref::Extern(None), RefType::ARRAYREF, false),
+        (Ref::Any(None), RefType::ARRAYREF, true),
+        (Ref::Func(None), RefType::ARRAYREF, false),
+        // nulls to i31ref
+        (Ref::Extern(None), RefType::I31REF, false),
+        (Ref::Any(None), RefType::I31REF, true),
+        (Ref::Func(None), RefType::I31REF, false),
+        // nulls to eqref
+        (Ref::Extern(None), RefType::EQREF, false),
+        (Ref::Any(None), RefType::EQREF, true),
+        (Ref::Func(None), RefType::EQREF, false),
+        // nulls to anyref
+        (Ref::Extern(None), RefType::ANYREF, false),
+        (Ref::Any(None), RefType::ANYREF, true),
+        (Ref::Func(None), RefType::ANYREF, false),
+        // non-null structref
+        (Ref::Any(Some(s)), RefType::NULLFUNCREF, false),
+        (Ref::Any(Some(s)), func_ref_ty.clone(), false),
+        (Ref::Any(Some(s)), RefType::FUNCREF, false),
+        (Ref::Any(Some(s)), RefType::NULLEXTERNREF, false),
+        (Ref::Any(Some(s)), RefType::EXTERNREF, false),
+        (Ref::Any(Some(s)), RefType::NULLREF, false),
+        (Ref::Any(Some(s)), RefType::STRUCTREF, true),
+        (Ref::Any(Some(s)), RefType::ARRAYREF, false),
+        (Ref::Any(Some(s)), RefType::I31REF, false),
+        (Ref::Any(Some(s)), RefType::EQREF, true),
+        (Ref::Any(Some(s)), RefType::ANYREF, true),
+        // non-null arrayref
+        (Ref::Any(Some(a)), RefType::NULLFUNCREF, false),
+        (Ref::Any(Some(a)), func_ref_ty.clone(), false),
+        (Ref::Any(Some(a)), RefType::FUNCREF, false),
+        (Ref::Any(Some(a)), RefType::NULLEXTERNREF, false),
+        (Ref::Any(Some(a)), RefType::EXTERNREF, false),
+        (Ref::Any(Some(a)), RefType::NULLREF, false),
+        (Ref::Any(Some(a)), RefType::STRUCTREF, false),
+        (Ref::Any(Some(a)), RefType::ARRAYREF, true),
+        (Ref::Any(Some(a)), RefType::I31REF, false),
+        (Ref::Any(Some(a)), RefType::EQREF, true),
+        (Ref::Any(Some(a)), RefType::ANYREF, true),
+        // non-null i31ref
+        (Ref::Any(Some(i31)), RefType::NULLFUNCREF, false),
+        (Ref::Any(Some(i31)), func_ref_ty.clone(), false),
+        (Ref::Any(Some(i31)), RefType::FUNCREF, false),
+        (Ref::Any(Some(i31)), RefType::NULLEXTERNREF, false),
+        (Ref::Any(Some(i31)), RefType::EXTERNREF, false),
+        (Ref::Any(Some(i31)), RefType::NULLREF, false),
+        (Ref::Any(Some(i31)), RefType::STRUCTREF, false),
+        (Ref::Any(Some(i31)), RefType::ARRAYREF, false),
+        (Ref::Any(Some(i31)), RefType::I31REF, true),
+        (Ref::Any(Some(i31)), RefType::EQREF, true),
+        (Ref::Any(Some(i31)), RefType::ANYREF, true),
+        // non-null funcref
+        (Ref::Func(Some(f)), RefType::NULLFUNCREF, false),
+        (Ref::Func(Some(f)), func_ref_ty.clone(), true),
+        (Ref::Func(Some(f)), RefType::FUNCREF, true),
+        (Ref::Func(Some(f)), RefType::NULLEXTERNREF, false),
+        (Ref::Func(Some(f)), RefType::EXTERNREF, false),
+        (Ref::Func(Some(f)), RefType::NULLREF, false),
+        (Ref::Func(Some(f)), RefType::STRUCTREF, false),
+        (Ref::Func(Some(f)), RefType::ARRAYREF, false),
+        (Ref::Func(Some(f)), RefType::I31REF, false),
+        (Ref::Func(Some(f)), RefType::EQREF, false),
+        (Ref::Func(Some(f)), RefType::ANYREF, false),
+        // non-null externref
+        (Ref::Extern(Some(e)), RefType::NULLFUNCREF, false),
+        (Ref::Extern(Some(e)), func_ref_ty.clone(), false),
+        (Ref::Extern(Some(e)), RefType::FUNCREF, false),
+        (Ref::Extern(Some(e)), RefType::NULLEXTERNREF, false),
+        (Ref::Extern(Some(e)), RefType::EXTERNREF, true),
+        (Ref::Extern(Some(e)), RefType::NULLREF, false),
+        (Ref::Extern(Some(e)), RefType::STRUCTREF, false),
+        (Ref::Extern(Some(e)), RefType::ARRAYREF, false),
+        (Ref::Extern(Some(e)), RefType::I31REF, false),
+        (Ref::Extern(Some(e)), RefType::EQREF, false),
+        (Ref::Extern(Some(e)), RefType::ANYREF, false),
+    ] {
+        let actual = val.matches_ty(&mut store, &ty)?;
+        assert_eq!(
+            actual, expected,
+            "{val:?} matches {ty:?}? expected {expected}, got {actual}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn issue_9669() -> Result<()> {
+    let _ = env_logger::try_init();
+
+    let mut config = Config::new();
+    config.wasm_function_references(true);
+    config.wasm_gc(true);
+    config.collector(Collector::DeferredReferenceCounting);
+
+    let engine = Engine::new(&config)?;
+
+    let module = Module::new(
+        &engine,
+        r#"
+            (module
+                (type $empty (struct))
+                (type $thing (struct
+                    (field $field1 (ref $empty))
+                    (field $field2 (ref $empty))
+                ))
+
+                (func (export "run")
+                    (local $object (ref $thing))
+
+                    struct.new $empty
+                    struct.new $empty
+                    struct.new $thing
+
+                    local.tee $object
+                    struct.get $thing $field1
+                    drop
+
+                    local.get $object
+                    struct.get $thing $field2
+                    drop
+                )
+            )
+        "#,
+    )?;
+
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[])?;
+
+    let func = instance.get_typed_func::<(), ()>(&mut store, "run")?;
+    func.call(&mut store, ())?;
+
+    Ok(())
+}
+
+#[test]
+fn drc_transitive_drop_cons_list() -> Result<()> {
+    let _ = env_logger::try_init();
+
+    let mut config = Config::new();
+    config.wasm_function_references(true);
+    config.wasm_gc(true);
+    config.collector(Collector::DeferredReferenceCounting);
+
+    let engine = Engine::new(&config)?;
+
+    // Define a module that defines a recursive type (a `cons` list of
+    // `externref`s) and exports a global of that type so that we can access it
+    // from the host, because we don't yet have host APIs for defining recursive
+    // types or rec groups.
+    let module = Module::new(
+        &engine,
+        r#"
+            (module
+                (type $cons (struct (field externref) (field (ref null $cons))))
+                (global (export "g") (ref null $cons) (ref.null $cons))
+            )
+        "#,
+    )?;
+
+    let export = module.exports().nth(0).unwrap().ty();
+    let global = export.unwrap_global();
+    let ref_ty = global.content().unwrap_ref();
+    let struct_ty = ref_ty.heap_type().unwrap_concrete_struct();
+
+    let mut store = Store::new(&engine, ());
+
+    let pre = StructRefPre::new(&mut store, struct_ty.clone());
+    let num_refs_dropped = Arc::new(AtomicUsize::new(0));
+
+    let len = if cfg!(miri) { 2 } else { 100 };
+    {
+        let mut store = RootScope::new(&mut store);
+
+        let mut cdr = None;
+        for _ in 0..len {
+            let externref = ExternRef::new(&mut store, CountDrops(num_refs_dropped.clone()))?;
+            let cons = StructRef::new(&mut store, &pre, &[externref.into(), cdr.into()])?;
+            cdr = Some(cons);
+        }
+
+        // Still holding the cons list alive at this point.
+        assert_eq!(num_refs_dropped.load(SeqCst), 0);
+    }
+
+    // Not holding the cons list alive anymore; should transitively drop
+    // everything we created.
+    store.gc();
+    assert_eq!(num_refs_dropped.load(SeqCst), len);
+
+    Ok(())
+}
+
+#[test]
+fn drc_transitive_drop_nested_arrays_tree() -> Result<()> {
+    let _ = env_logger::try_init();
+
+    let mut config = Config::new();
+    config.wasm_function_references(true);
+    config.wasm_gc(true);
+    config.collector(Collector::DeferredReferenceCounting);
+
+    let engine = Engine::new(&config)?;
+
+    let array_ty = ArrayType::new(
+        &engine,
+        FieldType::new(
+            Mutability::Var,
+            StorageType::ValType(ValType::Ref(RefType::ANYREF)),
+        ),
+    );
+
+    let mut store = Store::new(&engine, ());
+    let pre = ArrayRefPre::new(&mut store, array_ty);
+    let num_refs_dropped = Arc::new(AtomicUsize::new(0));
+    let mut expected = 0;
+
+    fn recursively_build_tree(
+        mut store: &mut RootScope<&mut Store<()>>,
+        pre: &ArrayRefPre,
+        num_refs_dropped: &Arc<AtomicUsize>,
+        expected: &mut usize,
+        depth: u32,
+    ) -> Result<Rooted<AnyRef>> {
+        let max = if cfg!(miri) { 1 } else { 3 };
+        if depth >= max {
+            *expected += 1;
+            let e = ExternRef::new(&mut store, CountDrops(num_refs_dropped.clone()))?;
+            AnyRef::convert_extern(&mut store, e)
+        } else {
+            let left = recursively_build_tree(store, pre, num_refs_dropped, expected, depth + 1)?;
+            let right = recursively_build_tree(store, pre, num_refs_dropped, expected, depth + 1)?;
+            let arr = ArrayRef::new_fixed(store, pre, &[left.into(), right.into()])?;
+            Ok(arr.to_anyref())
+        }
+    }
+
+    {
+        let mut store = RootScope::new(&mut store);
+        let _tree = recursively_build_tree(&mut store, &pre, &num_refs_dropped, &mut expected, 0)?;
+
+        // Still holding the tree alive at this point.
+        assert_eq!(num_refs_dropped.load(SeqCst), 0);
+    }
+
+    // Not holding the tree alive anymore; should transitively drop everything
+    // we created.
+    store.gc();
+    assert_eq!(num_refs_dropped.load(SeqCst), expected);
+
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn drc_traces_the_correct_number_of_gc_refs_in_arrays() -> Result<()> {
+    let _ = env_logger::try_init();
+
+    let mut config = Config::new();
+    config.wasm_function_references(true);
+    config.wasm_gc(true);
+    config.collector(Collector::DeferredReferenceCounting);
+
+    let engine = Engine::new(&config)?;
+    let mut store = Store::new(&engine, ());
+
+    // The DRC collector was mistakenly reporting that arrays of GC refs had
+    // `size_of(elems)` outgoing edges, rather than `len(elems)` edges. None of
+    // our existing tests happened to trigger this bug because although we were
+    // tricking the collector into tracing unallocated GC heap memory, it was
+    // all zeroed out and was treated as null GC references. We can avoid that
+    // in this regression test by first painting the heap with a large poison
+    // value before we start allocating arrays, so that if the GC tries tracing
+    // bogus heap memory, it finds very large GC ref heap indices and ultimately
+    // tries to follow them outside the bounds of the GC heap, which (before
+    // this bug was fixed) would lead to a panic.
+
+    let array_i8_ty = ArrayType::new(&engine, FieldType::new(Mutability::Var, StorageType::I8));
+    let array_i8_pre = ArrayRefPre::new(&mut store, array_i8_ty);
+
+    {
+        let mut store = RootScope::new(&mut store);
+
+        // Spray a poison pattern across the heap.
+        let len = 1_000_000;
+        let _poison = ArrayRef::new(&mut store, &array_i8_pre, &Val::I32(-1), len);
+    }
+
+    // Make sure the poison array is collected.
+    store.gc();
+
+    // Allocate and then collect an array of GC refs from Wasm. This should not
+    // trick the collector into tracing any poison and panicking.
+    let module = Module::new(
+        &engine,
+        r#"
+            (module
+                (type $ty (array (mut anyref)))
+                (start $f)
+                (func $f
+                    (drop (array.new $ty (ref.null any) (i32.const 1_000)))
+                )
+            )
+        "#,
+    )?;
+    let _instance = Instance::new(&mut store, &module, &[])?;
+    store.gc();
+
     Ok(())
 }

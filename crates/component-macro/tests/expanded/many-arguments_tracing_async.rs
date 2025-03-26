@@ -192,7 +192,7 @@ pub mod foo {
         #[allow(clippy::all)]
         pub mod manyarg {
             #[allow(unused_imports)]
-            use wasmtime::component::__internal::anyhow;
+            use wasmtime::component::__internal::{anyhow, Box};
             #[derive(wasmtime::component::ComponentType)]
             #[derive(wasmtime::component::Lift)]
             #[derive(wasmtime::component::Lower)]
@@ -274,7 +274,7 @@ pub mod foo {
                     4 == < BigStruct as wasmtime::component::ComponentType >::ALIGN32
                 );
             };
-            #[wasmtime::component::__internal::async_trait]
+            #[wasmtime::component::__internal::trait_variant_make(::core::marker::Send)]
             pub trait Host: Send {
                 async fn many_args(
                     &mut self,
@@ -299,19 +299,23 @@ pub mod foo {
             }
             pub trait GetHost<
                 T,
-            >: Fn(T) -> <Self as GetHost<T>>::Host + Send + Sync + Copy + 'static {
+                D,
+            >: Fn(T) -> <Self as GetHost<T, D>>::Host + Send + Sync + Copy + 'static {
                 type Host: Host + Send;
             }
-            impl<F, T, O> GetHost<T> for F
+            impl<F, T, D, O> GetHost<T, D> for F
             where
                 F: Fn(T) -> O + Send + Sync + Copy + 'static,
                 O: Host + Send,
             {
                 type Host = O;
             }
-            pub fn add_to_linker_get_host<T>(
+            pub fn add_to_linker_get_host<
+                T,
+                G: for<'a> GetHost<&'a mut T, T, Host: Host + Send>,
+            >(
                 linker: &mut wasmtime::component::Linker<T>,
-                host_getter: impl for<'a> GetHost<&'a mut T>,
+                host_getter: G,
             ) -> wasmtime::Result<()>
             where
                 T: Send,
@@ -451,7 +455,6 @@ pub mod foo {
             {
                 add_to_linker_get_host(linker, get)
             }
-            #[wasmtime::component::__internal::async_trait]
             impl<_T: Host + ?Sized + Send> Host for &mut _T {
                 async fn many_args(
                     &mut self,
@@ -506,7 +509,7 @@ pub mod exports {
             #[allow(clippy::all)]
             pub mod manyarg {
                 #[allow(unused_imports)]
-                use wasmtime::component::__internal::anyhow;
+                use wasmtime::component::__internal::{anyhow, Box};
                 #[derive(wasmtime::component::ComponentType)]
                 #[derive(wasmtime::component::Lift)]
                 #[derive(wasmtime::component::Lower)]

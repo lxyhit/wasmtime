@@ -177,26 +177,30 @@ const _: () = {
 #[allow(clippy::all)]
 pub mod imports {
     #[allow(unused_imports)]
-    use wasmtime::component::__internal::anyhow;
-    #[wasmtime::component::__internal::async_trait]
+    use wasmtime::component::__internal::{anyhow, Box};
+    #[wasmtime::component::__internal::trait_variant_make(::core::marker::Send)]
     pub trait Host: Send {
         async fn y(&mut self) -> ();
     }
     pub trait GetHost<
         T,
-    >: Fn(T) -> <Self as GetHost<T>>::Host + Send + Sync + Copy + 'static {
+        D,
+    >: Fn(T) -> <Self as GetHost<T, D>>::Host + Send + Sync + Copy + 'static {
         type Host: Host + Send;
     }
-    impl<F, T, O> GetHost<T> for F
+    impl<F, T, D, O> GetHost<T, D> for F
     where
         F: Fn(T) -> O + Send + Sync + Copy + 'static,
         O: Host + Send,
     {
         type Host = O;
     }
-    pub fn add_to_linker_get_host<T>(
+    pub fn add_to_linker_get_host<
+        T,
+        G: for<'a> GetHost<&'a mut T, T, Host: Host + Send>,
+    >(
         linker: &mut wasmtime::component::Linker<T>,
-        host_getter: impl for<'a> GetHost<&'a mut T>,
+        host_getter: G,
     ) -> wasmtime::Result<()>
     where
         T: Send,
@@ -224,7 +228,6 @@ pub mod imports {
     {
         add_to_linker_get_host(linker, get)
     }
-    #[wasmtime::component::__internal::async_trait]
     impl<_T: Host + ?Sized + Send> Host for &mut _T {
         async fn y(&mut self) -> () {
             Host::y(*self).await

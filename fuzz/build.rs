@@ -7,7 +7,6 @@ fn main() -> anyhow::Result<()> {
 mod component {
     use anyhow::{anyhow, Context, Error, Result};
     use arbitrary::Unstructured;
-    use component_fuzz_util::{Declarations, TestCase, Type, MAX_TYPE_DEPTH};
     use proc_macro2::TokenStream;
     use quote::quote;
     use rand::rngs::StdRng;
@@ -18,6 +17,7 @@ mod component {
     use std::iter;
     use std::path::PathBuf;
     use std::process::Command;
+    use wasmtime_test_util::component_fuzz::{Declarations, TestCase, Type, MAX_TYPE_DEPTH};
 
     pub fn generate_static_api_tests() -> Result<()> {
         println!("cargo:rerun-if-changed=build.rs");
@@ -41,7 +41,7 @@ mod component {
             seed.parse::<u64>()
                 .with_context(|| anyhow!("expected u64 in WASMTIME_FUZZ_SEED"))?
         } else {
-            StdRng::from_entropy().gen()
+            StdRng::from_entropy().r#gen()
         };
 
         eprintln!(
@@ -62,7 +62,7 @@ mod component {
 
         // First generate a set of type to select from.
         for _ in 0..TYPE_COUNT {
-            let ty = gen(&mut rng, |u| {
+            let ty = generate(&mut rng, |u| {
                 // Only discount fuel if the generation was successful,
                 // otherwise we'll get more random data and try again.
                 let mut fuel = type_fuel;
@@ -73,16 +73,17 @@ mod component {
                 ret
             })?;
 
-            let name = component_fuzz_util::rust_type(&ty, name_counter, &mut declarations);
+            let name =
+                wasmtime_test_util::component_fuzz::rust_type(&ty, name_counter, &mut declarations);
             types.push((name, ty));
         }
 
         // Next generate a set of static API test cases driven by the above
         // types.
         for index in 0..TEST_CASE_COUNT {
-            let (case, rust_params, rust_results) = gen(&mut rng, |u| {
+            let (case, rust_params, rust_results) = generate(&mut rng, |u| {
                 let mut params = Vec::new();
-                let mut results = Vec::new();
+                let mut result = None;
                 let mut rust_params = TokenStream::new();
                 let mut rust_results = TokenStream::new();
                 for _ in 0..u.int_in_range(0..=MAX_ARITY)? {
@@ -91,16 +92,16 @@ mod component {
                     rust_params.extend(name.clone());
                     rust_params.extend(quote!(,));
                 }
-                for _ in 0..u.int_in_range(0..=MAX_ARITY)? {
+                if u.arbitrary()? {
                     let (name, ty) = u.choose(&types)?;
-                    results.push(ty);
+                    result = Some(ty);
                     rust_results.extend(name.clone());
                     rust_results.extend(quote!(,));
                 }
 
                 let case = TestCase {
                     params,
-                    results,
+                    result,
                     encoding1: u.arbitrary()?,
                     encoding2: u.arbitrary()?,
                 };
@@ -140,8 +141,8 @@ mod component {
             #[allow(unused_imports)]
             fn static_component_api_target(input: &mut libfuzzer_sys::arbitrary::Unstructured) -> libfuzzer_sys::arbitrary::Result<()> {
                 use anyhow::Result;
-                use component_fuzz_util::Declarations;
-                use component_test_util::{self, Float32, Float64};
+                use wasmtime_test_util::component_fuzz::Declarations;
+                use wasmtime_test_util::component::{Float32, Float64};
                 use libfuzzer_sys::arbitrary::{self, Arbitrary};
                 use std::borrow::Cow;
                 use std::sync::{Arc, Once};
@@ -173,14 +174,14 @@ mod component {
         Ok(())
     }
 
-    fn gen<T>(
+    fn generate<T>(
         rng: &mut StdRng,
         mut f: impl FnMut(&mut Unstructured<'_>) -> arbitrary::Result<T>,
     ) -> Result<T> {
         let mut bytes = Vec::new();
         loop {
             let count = rng.gen_range(1000..2000);
-            bytes.extend(iter::repeat_with(|| rng.gen::<u8>()).take(count));
+            bytes.extend(iter::repeat_with(|| rng.r#gen::<u8>()).take(count));
 
             match f(&mut Unstructured::new(&bytes)) {
                 Ok(ret) => break Ok(ret),

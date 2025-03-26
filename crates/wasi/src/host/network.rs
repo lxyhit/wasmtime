@@ -3,7 +3,7 @@ use crate::bindings::sockets::network::{
     Ipv6SocketAddress,
 };
 use crate::network::{from_ipv4_addr, from_ipv6_addr, to_ipv4_addr, to_ipv6_addr};
-use crate::{SocketError, WasiImpl, WasiView};
+use crate::{IoView, SocketError, WasiImpl, WasiView};
 use anyhow::Error;
 use rustix::io::Errno;
 use std::io;
@@ -467,13 +467,13 @@ pub(crate) mod util {
     }
 
     pub fn get_ip_ttl<Fd: AsFd>(sockfd: Fd) -> rustix::io::Result<u8> {
-        sockopt::get_ip_ttl(sockfd)?
+        sockopt::ip_ttl(sockfd)?
             .try_into()
             .map_err(|_| Errno::OPNOTSUPP)
     }
 
     pub fn get_ipv6_unicast_hops<Fd: AsFd>(sockfd: Fd) -> rustix::io::Result<u8> {
-        sockopt::get_ipv6_unicast_hops(sockfd)
+        sockopt::ipv6_unicast_hops(sockfd)
     }
 
     pub fn set_ip_ttl<Fd: AsFd>(sockfd: Fd, value: u8) -> rustix::io::Result<()> {
@@ -513,12 +513,12 @@ pub(crate) mod util {
     }
 
     pub fn get_socket_recv_buffer_size<Fd: AsFd>(sockfd: Fd) -> rustix::io::Result<usize> {
-        let value = sockopt::get_socket_recv_buffer_size(sockfd)?;
+        let value = sockopt::socket_recv_buffer_size(sockfd)?;
         Ok(normalize_get_buffer_size(value))
     }
 
     pub fn get_socket_send_buffer_size<Fd: AsFd>(sockfd: Fd) -> rustix::io::Result<usize> {
-        let value = sockopt::get_socket_send_buffer_size(sockfd)?;
+        let value = sockopt::socket_send_buffer_size(sockfd)?;
         Ok(normalize_get_buffer_size(value))
     }
 

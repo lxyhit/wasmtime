@@ -30,9 +30,6 @@ wasmtime = { workspace = true, features = [
 # These dependencies are necessary for the wasi-nn implementation:
 tracing = { workspace = true }
 thiserror = { workspace = true }
-openvino = { version = "0.8.0", features = [
-    "runtime-linking",
-], optional = true }
 
 ort = { version = "2.0.0-rc.7", default-features = false, features = [
     "copy-dylibs",
@@ -40,6 +37,11 @@ ort = { version = "2.0.0-rc.7", default-features = false, features = [
     "half"
 ], optional = true }
 tch = { version = "0.17.0", default-features = false, optional = true}
+
+[target.'cfg(target_pointer_width = "64")'.dependencies]
+openvino = { version = "0.8.0", features = [
+    "runtime-linking",
+], optional = true }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.52"

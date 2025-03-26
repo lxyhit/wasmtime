@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 use core::fmt::Debug;
 use core::marker::PhantomData;
 use cranelift_control::ControlPlane;
+use std::string::String;
 use target_lexicon::{Architecture, Triple};
 
 pub use settings::Flags as PulleyFlags;
@@ -53,6 +54,10 @@ impl PointerWidth {
             PointerWidth::PointerWidth32 => 32,
             PointerWidth::PointerWidth64 => 64,
         }
+    }
+
+    pub fn bytes(self) -> u8 {
+        self.bits() / 8
     }
 }
 
@@ -119,7 +124,11 @@ where
         domtree: &DominatorTree,
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<(VCode<inst::InstAndKind<P>>, regalloc2::Output)> {
-        let emit_info = EmitInfo::new(self.flags.clone(), self.isa_flags.clone());
+        let emit_info = EmitInfo::new(
+            func.signature.call_conv,
+            self.flags.clone(),
+            self.isa_flags.clone(),
+        );
         let sigs = SigSet::new::<abi::PulleyMachineDeps<P>>(func, &self.flags)?;
         let abi = abi::PulleyCallee::new(func, self, &self.isa_flags, &sigs)?;
         machinst::compile::<Self>(func, domtree, self, abi, emit_info, sigs, ctrl_plane)
@@ -211,6 +220,10 @@ where
         inst::InstAndKind::<P>::function_alignment()
     }
 
+    fn pretty_print_reg(&self, reg: crate::Reg, _size: u8) -> String {
+        format!("{reg:?}")
+    }
+
     fn has_native_fma(&self) -> bool {
         false
     }
@@ -230,18 +243,18 @@ where
     fn has_x86_pmaddubsw_lowering(&self) -> bool {
         false
     }
+
+    fn default_argument_extension(&self) -> ir::ArgumentExtension {
+        ir::ArgumentExtension::None
+    }
 }
 
 /// Create a new Pulley ISA builder.
 pub fn isa_builder(triple: Triple) -> IsaBuilder {
-    assert!(matches!(
-        triple.architecture,
-        Architecture::Pulley32 | Architecture::Pulley64
-    ));
     let constructor = match triple.architecture {
-        Architecture::Pulley32 => isa_constructor_32,
-        Architecture::Pulley64 => isa_constructor_64,
-        _ => unreachable!(),
+        Architecture::Pulley32 | Architecture::Pulley32be => isa_constructor_32,
+        Architecture::Pulley64 | Architecture::Pulley64be => isa_constructor_64,
+        other => panic!("unexpected architecture {other:?}"),
     };
     IsaBuilder {
         triple,
@@ -258,6 +271,9 @@ fn isa_constructor_32(
     use crate::settings::Configurable;
     let mut builder = builder.clone();
     builder.set("pointer_width", "pointer32").unwrap();
+    if triple.endianness().unwrap() == target_lexicon::Endianness::Big {
+        builder.enable("big_endian").unwrap();
+    }
     let isa_flags = PulleyFlags::new(&shared_flags, &builder);
 
     let backend =
@@ -273,9 +289,22 @@ fn isa_constructor_64(
     use crate::settings::Configurable;
     let mut builder = builder.clone();
     builder.set("pointer_width", "pointer64").unwrap();
+    if triple.endianness().unwrap() == target_lexicon::Endianness::Big {
+        builder.enable("big_endian").unwrap();
+    }
     let isa_flags = PulleyFlags::new(&shared_flags, &builder);
 
     let backend =
         PulleyBackend::<super::pulley64::Pulley64>::new_with_flags(triple, shared_flags, isa_flags);
     Ok(backend.wrapped())
+}
+
+impl PulleyFlags {
+    fn endianness(&self) -> ir::Endianness {
+        if self.big_endian() {
+            ir::Endianness::Big
+        } else {
+            ir::Endianness::Little
+        }
+    }
 }

@@ -113,7 +113,7 @@ impl Val {
             }
             InterfaceType::String => Val::String(<_>::lift(cx, ty, &[*next(src), *next(src)])?),
             InterfaceType::List(i) => {
-                // FIXME: needs memory64 treatment
+                // FIXME(#4311): needs memory64 treatment
                 let ptr = u32::lift(cx, InterfaceType::U32, next(src))? as usize;
                 let len = u32::lift(cx, InterfaceType::U32, next(src))? as usize;
                 load_list(cx, i, ptr, len)?
@@ -198,6 +198,9 @@ impl Val {
 
                 Val::Flags(flags.into())
             }
+            InterfaceType::Future(_)
+            | InterfaceType::Stream(_)
+            | InterfaceType::ErrorContext(_) => todo!(),
         })
     }
 
@@ -221,7 +224,7 @@ impl Val {
                 Val::Resource(ResourceAny::load(cx, ty, bytes)?)
             }
             InterfaceType::List(i) => {
-                // FIXME: needs memory64 treatment
+                // FIXME(#4311): needs memory64 treatment
                 let ptr = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
                 let len = u32::from_le_bytes(bytes[4..].try_into().unwrap()) as usize;
                 load_list(cx, i, ptr, len)?
@@ -319,6 +322,9 @@ impl Val {
                 }
                 Val::Flags(flags.into())
             }
+            InterfaceType::Future(_)
+            | InterfaceType::Stream(_)
+            | InterfaceType::ErrorContext(_) => todo!(),
         })
     }
 
@@ -429,6 +435,9 @@ impl Val {
                 Ok(())
             }
             (InterfaceType::Flags(_), _) => unexpected(ty, self),
+            (InterfaceType::Future(_), _)
+            | (InterfaceType::Stream(_), _)
+            | (InterfaceType::ErrorContext(_), _) => todo!(),
         }
     }
 
@@ -439,9 +448,7 @@ impl Val {
         ty: InterfaceType,
         offset: usize,
     ) -> Result<()> {
-        debug_assert!(
-            offset % usize::try_from(cx.types.canonical_abi(&ty).align32).err2anyhow()? == 0
-        );
+        debug_assert!(offset % usize::try_from(cx.types.canonical_abi(&ty).align32)? == 0);
 
         match (ty, self) {
             (InterfaceType::Bool, Val::Bool(value)) => value.store(cx, ty, offset),
@@ -479,7 +486,7 @@ impl Val {
             (InterfaceType::List(ty), Val::List(values)) => {
                 let ty = &cx.types[ty];
                 let (ptr, len) = lower_list(cx, ty.element, values)?;
-                // FIXME: needs memory64 handling
+                // FIXME(#4311): needs memory64 handling
                 *cx.get(offset + 0) = u32::try_from(ptr).unwrap().to_le_bytes();
                 *cx.get(offset + 4) = u32::try_from(len).unwrap().to_le_bytes();
                 Ok(())
@@ -566,6 +573,9 @@ impl Val {
                 Ok(())
             }
             (InterfaceType::Flags(_), _) => unexpected(ty, self),
+            (InterfaceType::Future(_), _)
+            | (InterfaceType::Stream(_), _)
+            | (InterfaceType::ErrorContext(_), _) => todo!(),
         }
     }
 
@@ -594,6 +604,19 @@ impl Val {
             Val::Resource(_) => "resource",
             Val::Flags(_) => "flags",
         }
+    }
+
+    /// Deserialize a [`Val`] from its [`crate::component::wasm_wave`] encoding. Deserialization
+    /// requires a target [`crate::component::Type`].
+    #[cfg(feature = "wave")]
+    pub fn from_wave(ty: &crate::component::Type, s: &str) -> Result<Self> {
+        Ok(wasm_wave::from_str(ty, s)?)
+    }
+
+    /// Serialize a [`Val`] to its [`crate::component::wasm_wave`] encoding.
+    #[cfg(feature = "wave")]
+    pub fn to_wave(&self) -> Result<String> {
+        Ok(wasm_wave::to_string(self)?)
     }
 }
 
@@ -819,7 +842,7 @@ fn load_list(cx: &mut LiftContext<'_>, ty: TypeListIndex, ptr: usize, len: usize
         Some(n) if n <= cx.memory().len() => {}
         _ => bail!("list pointer/length out of bounds of memory"),
     }
-    if ptr % usize::try_from(element_alignment).err2anyhow()? != 0 {
+    if ptr % usize::try_from(element_alignment)? != 0 {
         bail!("list pointer is not aligned")
     }
 
@@ -901,7 +924,7 @@ fn lower_list<T>(
     items: &[Val],
 ) -> Result<(usize, usize)> {
     let abi = cx.types.canonical_abi(&element_type);
-    let elt_size = usize::try_from(abi.size32).err2anyhow()?;
+    let elt_size = usize::try_from(abi.size32)?;
     let elt_align = abi.align32;
     let size = items
         .len()

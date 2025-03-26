@@ -141,7 +141,6 @@ use clap::Parser;
 use std::os::raw::{c_int, c_void};
 use std::slice;
 use std::{env, path::PathBuf};
-use target_lexicon::Triple;
 use wasi_common::{sync::WasiCtxBuilder, I32Exit, WasiCtx};
 use wasmtime::{Engine, Instance, Linker, Module, Store};
 use wasmtime_cli_flags::CommonOptions;
@@ -266,7 +265,7 @@ impl WasmBenchConfig {
 /// that contains the engine's initialized state, and `0` is returned. On
 /// failure, a non-zero status code is returned and `out_bench_ptr` is left
 /// untouched.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasm_bench_create(
     config: WasmBenchConfig,
     out_bench_ptr: *mut *mut c_void,
@@ -348,7 +347,7 @@ pub extern "C" fn wasm_bench_create(
 }
 
 /// Free the engine state allocated by this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasm_bench_free(state: *mut c_void) {
     assert!(!state.is_null());
     unsafe {
@@ -357,7 +356,7 @@ pub extern "C" fn wasm_bench_free(state: *mut c_void) {
 }
 
 /// Compile the Wasm benchmark module.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasm_bench_compile(
     state: *mut c_void,
     wasm_bytes: *const u8,
@@ -370,7 +369,7 @@ pub extern "C" fn wasm_bench_compile(
 }
 
 /// Instantiate the Wasm benchmark module.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasm_bench_instantiate(state: *mut c_void) -> ExitCode {
     let state = unsafe { (state as *mut BenchState).as_mut().unwrap() };
     let result = state.instantiate().context("failed to instantiate");
@@ -378,7 +377,7 @@ pub extern "C" fn wasm_bench_instantiate(state: *mut c_void) -> ExitCode {
 }
 
 /// Execute the Wasm benchmark module.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn wasm_bench_execute(state: *mut c_void) -> ExitCode {
     let state = unsafe { (state as *mut BenchState).as_mut().unwrap() };
     let result = state.execute().context("failed to execute");
@@ -435,7 +434,7 @@ impl BenchState {
         execution_end: extern "C" fn(*mut u8),
         make_wasi_cx: impl FnMut() -> Result<WasiCtx> + 'static,
     ) -> Result<Self> {
-        let mut config = options.config(Some(&Triple::host().to_string()), None)?;
+        let mut config = options.config(None)?;
         // NB: always disable the compilation cache.
         config.disable_cache();
         let engine = Engine::new(&config)?;
@@ -485,10 +484,7 @@ impl BenchState {
     }
 
     fn compile(&mut self, bytes: &[u8]) -> Result<()> {
-        assert!(
-            self.module.is_none(),
-            "create a new engine to repeat compilation"
-        );
+        self.module = None;
 
         (self.compilation_start)(self.compilation_timer);
         let module = Module::from_binary(self.linker.engine(), bytes)?;
@@ -499,6 +495,8 @@ impl BenchState {
     }
 
     fn instantiate(&mut self) -> Result<()> {
+        self.store_and_instance = None;
+
         let module = self
             .module
             .as_ref()

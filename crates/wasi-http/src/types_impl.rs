@@ -13,11 +13,8 @@ use crate::{
 use anyhow::Context;
 use std::any::Any;
 use std::str::FromStr;
-use wasmtime::component::{Resource, ResourceTable};
-use wasmtime_wasi::{
-    bindings::io::streams::{InputStream, OutputStream},
-    Pollable, ResourceTableError,
-};
+use wasmtime::component::{Resource, ResourceTable, ResourceTableError};
+use wasmtime_wasi::{DynInputStream, DynOutputStream, DynPollable, IoView};
 
 impl<T> crate::bindings::http::types::Host for WasiHttpImpl<T>
 where
@@ -391,6 +388,8 @@ where
         &mut self,
         request: Resource<HostOutgoingRequest>,
     ) -> wasmtime::Result<Result<Resource<HostOutgoingBody>, ()>> {
+        let buffer_chunks = self.outgoing_body_buffer_chunks();
+        let chunk_size = self.outgoing_body_chunk_size();
         let req = self
             .table()
             .get_mut(&request)
@@ -405,7 +404,8 @@ where
             Err(e) => return Ok(Err(e)),
         };
 
-        let (host_body, hyper_body) = HostOutgoingBody::new(StreamContext::Request, size);
+        let (host_body, hyper_body) =
+            HostOutgoingBody::new(StreamContext::Request, size, buffer_chunks, chunk_size);
 
         req.body = Some(hyper_body);
 
@@ -659,7 +659,7 @@ where
     fn subscribe(
         &mut self,
         index: Resource<HostFutureTrailers>,
-    ) -> wasmtime::Result<Resource<Pollable>> {
+    ) -> wasmtime::Result<Resource<DynPollable>> {
         wasmtime_wasi::subscribe(self.table(), index)
     }
 
@@ -701,11 +701,11 @@ where
     fn stream(
         &mut self,
         id: Resource<HostIncomingBody>,
-    ) -> wasmtime::Result<Result<Resource<InputStream>, ()>> {
+    ) -> wasmtime::Result<Result<Resource<DynInputStream>, ()>> {
         let body = self.table().get_mut(&id)?;
 
         if let Some(stream) = body.take_stream() {
-            let stream: InputStream = Box::new(stream);
+            let stream: DynInputStream = Box::new(stream);
             let stream = self.table().push_child(stream, &id)?;
             return Ok(Ok(stream));
         }
@@ -751,6 +751,8 @@ where
         &mut self,
         id: Resource<HostOutgoingResponse>,
     ) -> wasmtime::Result<Result<Resource<HostOutgoingBody>, ()>> {
+        let buffer_chunks = self.outgoing_body_buffer_chunks();
+        let chunk_size = self.outgoing_body_chunk_size();
         let resp = self.table().get_mut(&id)?;
 
         if resp.body.is_some() {
@@ -762,7 +764,8 @@ where
             Err(e) => return Ok(Err(e)),
         };
 
-        let (host, body) = HostOutgoingBody::new(StreamContext::Response, size);
+        let (host, body) =
+            HostOutgoingBody::new(StreamContext::Response, size, buffer_chunks, chunk_size);
 
         resp.body.replace(body);
 
@@ -877,7 +880,7 @@ where
     fn subscribe(
         &mut self,
         id: Resource<HostFutureIncomingResponse>,
-    ) -> wasmtime::Result<Resource<Pollable>> {
+    ) -> wasmtime::Result<Resource<DynPollable>> {
         wasmtime_wasi::subscribe(self.table(), id)
     }
 }
@@ -889,7 +892,7 @@ where
     fn write(
         &mut self,
         id: Resource<HostOutgoingBody>,
-    ) -> wasmtime::Result<Result<Resource<OutputStream>, ()>> {
+    ) -> wasmtime::Result<Result<Resource<DynOutputStream>, ()>> {
         let body = self.table().get_mut(&id)?;
         if let Some(stream) = body.take_output_stream() {
             let id = self.table().push_child(stream, &id)?;

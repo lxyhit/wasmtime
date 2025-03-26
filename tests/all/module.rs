@@ -1,25 +1,47 @@
 use anyhow::Context;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
+use target_lexicon::Triple;
 use wasmtime::*;
+use wasmtime_environ::TripleExt;
 use wasmtime_test_macros::wasmtime_test;
 
 #[test]
 fn checks_incompatible_target() -> Result<()> {
-    let mut target = target_lexicon::Triple::host();
-    target.operating_system = target_lexicon::OperatingSystem::Unknown;
-    match Module::new(
-        &Engine::new(Config::new().target(&target.to_string())?)?,
-        "(module)",
-    ) {
-        Ok(_) => unreachable!(),
-        Err(e) => assert!(
-            format!("{e:?}").contains("configuration does not match the host"),
-            "bad error: {e:?}"
-        ),
+    // For platforms that Cranelift supports make sure a mismatch generates an
+    // error
+    if cfg!(target_arch = "x86_64")
+        || cfg!(target_arch = "aarch64")
+        || cfg!(target_arch = "s390x")
+        || cfg!(target_arch = "riscv64")
+    {
+        let mut target = target_lexicon::Triple::host();
+        target.operating_system = target_lexicon::OperatingSystem::Unknown;
+        assert_invalid_target(&target.to_string())?;
     }
 
-    Ok(())
+    // Otherwise make sure that the wrong pulley target is rejected on all
+    // platforms.
+    let wrong_pulley = if cfg!(target_pointer_width = "32") {
+        "pulley64"
+    } else {
+        "pulley32"
+    };
+    assert_invalid_target(wrong_pulley)?;
+
+    return Ok(());
+
+    fn assert_invalid_target(target: &str) -> Result<()> {
+        match Module::new(&Engine::new(Config::new().target(target)?)?, "(module)") {
+            Ok(_) => unreachable!(),
+            Err(e) => assert!(
+                format!("{e:?}").contains("configuration does not match the host"),
+                "bad error: {e:?}"
+            ),
+        }
+
+        Ok(())
+    }
 }
 
 #[test]
@@ -45,7 +67,7 @@ fn caches_across_engines() {
         // differ in wasm features enabled (which can affect
         // runtime/compilation settings)
         let res = Module::deserialize(
-            &Engine::new(Config::new().wasm_threads(false)).unwrap(),
+            &Engine::new(Config::new().wasm_relaxed_simd(false)).unwrap(),
             &bytes,
         );
         assert!(res.is_err());
@@ -255,6 +277,7 @@ fn compile_a_component() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn tail_call_defaults() -> Result<()> {
     let wasm_with_tail_calls = "(module (func $a return_call $a))";
 
@@ -279,6 +302,7 @@ fn tail_call_defaults() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn cross_engine_module_exports() -> Result<()> {
     let a_engine = Engine::default();
     let b_engine = Engine::default();
@@ -533,4 +557,95 @@ fn concurrent_type_modifications_and_checks(config: &mut Config) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn validate_deterministic() {
+    let mut faulty_wat = "(module ".to_string();
+    for i in 0..100 {
+        faulty_wat.push_str(&format!(
+            "(func (export \"foo_{i}\") (result i64) (i64.add (i32.const 0) (i64.const 1)))"
+        ));
+    }
+    faulty_wat.push_str(")");
+    let binary = wat::parse_str(faulty_wat).unwrap();
+
+    let engine_parallel = Engine::new(&Config::new().parallel_compilation(true)).unwrap();
+    let result_parallel = Module::validate(&engine_parallel, &binary)
+        .unwrap_err()
+        .to_string();
+
+    let engine_sequential = Engine::new(&Config::new().parallel_compilation(false)).unwrap();
+    let result_sequential = Module::validate(&engine_sequential, &binary)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(result_parallel, result_sequential);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn deserialize_raw_avoids_copy() {
+    // target pulley; executing code directly requires virtual memory
+    let mut config = Config::new();
+    let target = format!("{}", Triple::pulley_host());
+    config.target(&target).unwrap();
+    let engine = Engine::new(&config).unwrap();
+    let wat = String::from(
+        r#"
+        (module
+            (func (export "add") (param $lhs i32) (param $rhs i32) (result i32)
+                (i32.add (local.get $lhs) (local.get $rhs))
+            )
+        )
+        "#,
+    );
+    let module = Module::new(&engine, &wat).unwrap();
+    let mut serialized = module.serialize().expect("Serialize failed");
+    let serialized_ptr = std::ptr::slice_from_raw_parts(serialized.as_mut_ptr(), serialized.len());
+    let module_memory = std::ptr::NonNull::new(serialized_ptr.cast_mut()).unwrap();
+    let deserialized_module =
+        unsafe { Module::deserialize_raw(&engine, module_memory).expect("Deserialize Failed") };
+
+    // assert that addresses haven't changed, no full copy
+    // TODO: haven't been able to find a pub way of doing this
+
+    // basic verification that the loaded module works
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &deserialized_module, &[]).unwrap();
+    let f = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "add")
+        .unwrap();
+    assert_eq!(f.call(&mut store, (26, 50)).unwrap(), 76);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn deserialize_raw_fails_for_native() {
+    // target pulley
+    let engine = Engine::default();
+    let wat = String::from(
+        r#"
+        (module
+            (func (export "add") (param $lhs i32) (param $rhs i32) (result i32)
+                (i32.add (local.get $lhs) (local.get $rhs))
+            )
+        )
+        "#,
+    );
+    let module = Module::new(&engine, &wat).unwrap();
+    let mut serialized = module.serialize().expect("Serialize failed");
+    let serialized_ptr = std::ptr::slice_from_raw_parts(serialized.as_mut_ptr(), serialized.len());
+    let module_memory = std::ptr::NonNull::new(serialized_ptr.cast_mut()).unwrap();
+    let deserialize_res = unsafe { Module::deserialize_raw(&engine, module_memory) };
+
+    if engine.is_pulley() {
+        let _mod = deserialize_res.expect("Module should deserialize fine for pulley");
+    } else {
+        let err = deserialize_res.expect_err("Deserialization should fail for host target");
+        assert_eq!(
+            format!("{err}"),
+            "this target requires virtual memory to be enabled"
+        );
+    }
 }

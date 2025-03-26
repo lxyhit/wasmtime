@@ -201,6 +201,14 @@ pub trait MachInst: Clone + Debug {
     /// architecture.
     fn function_alignment() -> FunctionAlignment;
 
+    /// Is this a low-level, one-way branch, not meant for use in a
+    /// VCode body? These instructions are meant to be used only when
+    /// directly emitted, i.e. when `MachInst` is used as an assembler
+    /// library.
+    fn is_low_level_branch(&self) -> bool {
+        false
+    }
+
     /// A label-use kind: a type that describes the types of label references that
     /// can occur in an instruction.
     type LabelUse: MachInstLabelUse;
@@ -553,6 +561,10 @@ pub trait TextSectionBuilder {
 
     /// A debug-only option which is used to for
     fn force_veneers(&mut self);
+
+    /// Write the `data` provided at `offset`, for example when resolving a
+    /// relocation.
+    fn write(&mut self, offset: u64, data: &[u8]);
 
     /// Completes this text section, filling out any final details, and returns
     /// the bytes of the text section.

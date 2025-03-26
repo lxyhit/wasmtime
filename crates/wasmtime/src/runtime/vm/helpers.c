@@ -61,16 +61,15 @@ typedef sigjmp_buf platform_jmp_buf;
 #define CONCAT(a, b) CONCAT2(a, b)
 #define VERSIONED_SYMBOL(a) CONCAT(a, VERSIONED_SUFFIX)
 
-int VERSIONED_SYMBOL(wasmtime_setjmp)(void **buf_storage,
-                                      void (*body)(void *, void *),
-                                      void *payload, void *callee) {
+bool VERSIONED_SYMBOL(wasmtime_setjmp)(void **buf_storage,
+                                       bool (*body)(void *, void *),
+                                       void *payload, void *callee) {
   platform_jmp_buf buf;
   if (platform_setjmp(buf) != 0) {
-    return 0;
+    return false;
   }
   *buf_storage = &buf;
-  body(payload, callee);
-  return 1;
+  return body(payload, callee);
 }
 
 void VERSIONED_SYMBOL(wasmtime_longjmp)(void *JmpBuf) {
@@ -78,45 +77,37 @@ void VERSIONED_SYMBOL(wasmtime_longjmp)(void *JmpBuf) {
   platform_longjmp(*buf, 1);
 }
 
+#ifdef FEATURE_DEBUG_BUILTINS
 #ifdef CFG_TARGET_OS_windows
-// export required for external access.
-__declspec(dllexport)
+#define DEBUG_BUILTIN_EXPORT __declspec(dllexport)
 #else
-// Note the `weak` linkage here, though, which is intended to let other code
-// override this symbol if it's defined elsewhere, since this definition doesn't
-// matter.
-// Just in case cross-language LTO is enabled we set the `noinline` attribute
-// and also try to have some sort of side effect in this function with a dummy
-// `asm` statement.
-__attribute__((weak, noinline))
+#define DEBUG_BUILTIN_EXPORT
 #endif
-    void __jit_debug_register_code() {
+
+// This set of symbols is defined here in C because Rust's #[export_name]
+// functions are not dllexported on Windows when building an executable. These
+// symbols are directly referenced by name from the native DWARF info.
+void *VERSIONED_SYMBOL(resolve_vmctx_memory_ptr)(void *);
+DEBUG_BUILTIN_EXPORT void *
+VERSIONED_SYMBOL(wasmtime_resolve_vmctx_memory_ptr)(void *p) {
+  return VERSIONED_SYMBOL(resolve_vmctx_memory_ptr)(p);
+}
+void VERSIONED_SYMBOL(set_vmctx_memory)(void *);
+DEBUG_BUILTIN_EXPORT void VERSIONED_SYMBOL(wasmtime_set_vmctx_memory)(void *p) {
+  VERSIONED_SYMBOL(set_vmctx_memory)(p);
+}
+
+// Helper symbol called from Rust to force the above two functions to not get
+// stripped by the linker.
+void VERSIONED_SYMBOL(wasmtime_debug_builtins_init)() {
 #ifndef CFG_TARGET_OS_windows
-  __asm__("");
+  void *volatile p;
+  p = (void *)&VERSIONED_SYMBOL(wasmtime_resolve_vmctx_memory_ptr);
+  p = (void *)&VERSIONED_SYMBOL(wasmtime_set_vmctx_memory);
+  (void)p;
 #endif
 }
-
-struct JITDescriptor {
-  uint32_t version_;
-  uint32_t action_flag_;
-  void *relevant_entry_;
-  void *first_entry_;
-};
-
-#ifdef CFG_TARGET_OS_windows
-// export required for external access.
-__declspec(dllexport)
-#else
-// Note the `weak` linkage here which is the same purpose as above. We want to
-// let other runtimes be able to override this since our own definition isn't
-// important.
-__attribute__((weak))
-#endif
-    struct JITDescriptor __jit_debug_descriptor = {1, 0, NULL, NULL};
-
-struct JITDescriptor *VERSIONED_SYMBOL(wasmtime_jit_debug_descriptor)() {
-  return &__jit_debug_descriptor;
-}
+#endif // FEATURE_DEBUG_BUILTINS
 
 // For more information about this see `unix/unwind.rs` and the
 // `using_libunwind` function. The basic idea is that weak symbols aren't stable

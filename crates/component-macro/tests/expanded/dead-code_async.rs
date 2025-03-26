@@ -181,7 +181,7 @@ pub mod a {
         #[allow(clippy::all)]
         pub mod interface_with_live_type {
             #[allow(unused_imports)]
-            use wasmtime::component::__internal::anyhow;
+            use wasmtime::component::__internal::{anyhow, Box};
             #[derive(wasmtime::component::ComponentType)]
             #[derive(wasmtime::component::Lift)]
             #[derive(wasmtime::component::Lower)]
@@ -202,25 +202,29 @@ pub mod a {
                     4 == < LiveType as wasmtime::component::ComponentType >::ALIGN32
                 );
             };
-            #[wasmtime::component::__internal::async_trait]
+            #[wasmtime::component::__internal::trait_variant_make(::core::marker::Send)]
             pub trait Host: Send {
                 async fn f(&mut self) -> LiveType;
             }
             pub trait GetHost<
                 T,
-            >: Fn(T) -> <Self as GetHost<T>>::Host + Send + Sync + Copy + 'static {
+                D,
+            >: Fn(T) -> <Self as GetHost<T, D>>::Host + Send + Sync + Copy + 'static {
                 type Host: Host + Send;
             }
-            impl<F, T, O> GetHost<T> for F
+            impl<F, T, D, O> GetHost<T, D> for F
             where
                 F: Fn(T) -> O + Send + Sync + Copy + 'static,
                 O: Host + Send,
             {
                 type Host = O;
             }
-            pub fn add_to_linker_get_host<T>(
+            pub fn add_to_linker_get_host<
+                T,
+                G: for<'a> GetHost<&'a mut T, T, Host: Host + Send>,
+            >(
                 linker: &mut wasmtime::component::Linker<T>,
-                host_getter: impl for<'a> GetHost<&'a mut T>,
+                host_getter: G,
             ) -> wasmtime::Result<()>
             where
                 T: Send,
@@ -248,7 +252,6 @@ pub mod a {
             {
                 add_to_linker_get_host(linker, get)
             }
-            #[wasmtime::component::__internal::async_trait]
             impl<_T: Host + ?Sized + Send> Host for &mut _T {
                 async fn f(&mut self) -> LiveType {
                     Host::f(*self).await
@@ -258,24 +261,78 @@ pub mod a {
         #[allow(clippy::all)]
         pub mod interface_with_dead_type {
             #[allow(unused_imports)]
-            use wasmtime::component::__internal::anyhow;
-            #[wasmtime::component::__internal::async_trait]
+            use wasmtime::component::__internal::{anyhow, Box};
+            pub type LiveType = super::super::super::a::b::interface_with_live_type::LiveType;
+            const _: () = {
+                assert!(4 == < LiveType as wasmtime::component::ComponentType >::SIZE32);
+                assert!(
+                    4 == < LiveType as wasmtime::component::ComponentType >::ALIGN32
+                );
+            };
+            #[derive(wasmtime::component::ComponentType)]
+            #[derive(wasmtime::component::Lift)]
+            #[derive(wasmtime::component::Lower)]
+            #[component(record)]
+            #[derive(Clone, Copy)]
+            pub struct DeadType {
+                #[component(name = "a")]
+                pub a: u32,
+            }
+            impl core::fmt::Debug for DeadType {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.debug_struct("DeadType").field("a", &self.a).finish()
+                }
+            }
+            const _: () = {
+                assert!(4 == < DeadType as wasmtime::component::ComponentType >::SIZE32);
+                assert!(
+                    4 == < DeadType as wasmtime::component::ComponentType >::ALIGN32
+                );
+            };
+            #[derive(wasmtime::component::ComponentType)]
+            #[derive(wasmtime::component::Lift)]
+            #[derive(wasmtime::component::Lower)]
+            #[component(variant)]
+            #[derive(Clone, Copy)]
+            pub enum V {
+                #[component(name = "a")]
+                A(LiveType),
+                #[component(name = "b")]
+                B(DeadType),
+            }
+            impl core::fmt::Debug for V {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    match self {
+                        V::A(e) => f.debug_tuple("V::A").field(e).finish(),
+                        V::B(e) => f.debug_tuple("V::B").field(e).finish(),
+                    }
+                }
+            }
+            const _: () = {
+                assert!(8 == < V as wasmtime::component::ComponentType >::SIZE32);
+                assert!(4 == < V as wasmtime::component::ComponentType >::ALIGN32);
+            };
+            #[wasmtime::component::__internal::trait_variant_make(::core::marker::Send)]
             pub trait Host: Send {}
             pub trait GetHost<
                 T,
-            >: Fn(T) -> <Self as GetHost<T>>::Host + Send + Sync + Copy + 'static {
+                D,
+            >: Fn(T) -> <Self as GetHost<T, D>>::Host + Send + Sync + Copy + 'static {
                 type Host: Host + Send;
             }
-            impl<F, T, O> GetHost<T> for F
+            impl<F, T, D, O> GetHost<T, D> for F
             where
                 F: Fn(T) -> O + Send + Sync + Copy + 'static,
                 O: Host + Send,
             {
                 type Host = O;
             }
-            pub fn add_to_linker_get_host<T>(
+            pub fn add_to_linker_get_host<
+                T,
+                G: for<'a> GetHost<&'a mut T, T, Host: Host + Send>,
+            >(
                 linker: &mut wasmtime::component::Linker<T>,
-                host_getter: impl for<'a> GetHost<&'a mut T>,
+                host_getter: G,
             ) -> wasmtime::Result<()>
             where
                 T: Send,
@@ -293,7 +350,6 @@ pub mod a {
             {
                 add_to_linker_get_host(linker, get)
             }
-            #[wasmtime::component::__internal::async_trait]
             impl<_T: Host + ?Sized + Send> Host for &mut _T {}
         }
     }

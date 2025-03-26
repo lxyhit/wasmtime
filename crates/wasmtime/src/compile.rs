@@ -37,9 +37,9 @@ use std::{
 use wasmtime_environ::component::Translator;
 use wasmtime_environ::{
     BuiltinFunctionIndex, CompiledFunctionInfo, CompiledModuleInfo, Compiler, DefinedFuncIndex,
-    FinishedObject, FunctionBodyData, ModuleEnvironment, ModuleInternedTypeIndex,
+    FilePos, FinishedObject, FunctionBodyData, ModuleEnvironment, ModuleInternedTypeIndex,
     ModuleTranslation, ModuleTypes, ModuleTypesBuilder, ObjectKind, PrimaryMap, RelocationTarget,
-    StaticModuleIndex, WasmFunctionInfo,
+    StaticModuleIndex,
 };
 
 mod code_builder;
@@ -64,6 +64,7 @@ pub(crate) fn build_artifacts<T: FinishedObject>(
     engine: &Engine,
     wasm: &[u8],
     dwarf_package: Option<&[u8]>,
+    obj_state: &T::State,
 ) -> Result<(T, Option<(CompiledModuleInfo, ModuleTypes)>)> {
     let tunables = engine.tunables();
 
@@ -80,8 +81,7 @@ pub(crate) fn build_artifacts<T: FinishedObject>(
         .context("failed to parse WebAssembly module")?;
     let functions = mem::take(&mut translation.function_body_inputs);
 
-    let compile_inputs =
-        CompileInputs::for_module(engine.compiler().triple(), &types, &translation, functions);
+    let compile_inputs = CompileInputs::for_module(&types, &translation, functions);
     let unlinked_compile_outputs = compile_inputs.compile(engine)?;
     let (compiled_funcs, function_indices) = unlinked_compile_outputs.pre_link();
 
@@ -112,7 +112,7 @@ pub(crate) fn build_artifacts<T: FinishedObject>(
     let info = compilation_artifacts.unwrap_as_module_info();
     let types = types.finish();
     object.serialize_info(&(&info, &types));
-    let result = T::finish_object(object)?;
+    let result = T::finish_object(object, obj_state)?;
 
     Ok((result, Some((info, types))))
 }
@@ -129,6 +129,7 @@ pub(crate) fn build_component_artifacts<T: FinishedObject>(
     engine: &Engine,
     binary: &[u8],
     _dwarf_package: Option<&[u8]>,
+    obj_state: &T::State,
 ) -> Result<(T, Option<wasmtime_environ::component::ComponentArtifacts>)> {
     use wasmtime_environ::component::{
         CompiledComponentInfo, ComponentArtifacts, ComponentTypesBuilder,
@@ -187,7 +188,7 @@ pub(crate) fn build_component_artifacts<T: FinishedObject>(
     };
     object.serialize_info(&artifacts);
 
-    let result = T::finish_object(object)?;
+    let result = T::finish_object(object, obj_state)?;
     Ok((result, Some(artifacts)))
 }
 
@@ -318,15 +319,12 @@ struct CompileOutput {
     key: CompileKey,
     symbol: String,
     function: CompiledFunction<Box<dyn Any + Send>>,
-    info: Option<WasmFunctionInfo>,
+    start_srcloc: FilePos,
 }
 
 /// The collection of things we need to compile for a Wasm module or component.
 #[derive(Default)]
 struct CompileInputs<'a> {
-    // Whether or not we need to compile wasm-to-native trampolines.
-    need_wasm_to_array_trampolines: bool,
-
     inputs: Vec<CompileInput<'a>>,
 }
 
@@ -337,18 +335,11 @@ impl<'a> CompileInputs<'a> {
 
     /// Create the `CompileInputs` for a core Wasm module.
     fn for_module(
-        triple: &target_lexicon::Triple,
         types: &'a ModuleTypesBuilder,
         translation: &'a ModuleTranslation<'a>,
         functions: PrimaryMap<DefinedFuncIndex, FunctionBodyData<'a>>,
     ) -> Self {
-        let mut ret = CompileInputs {
-            need_wasm_to_array_trampolines: !matches!(
-                triple.architecture,
-                target_lexicon::Architecture::Pulley32 | target_lexicon::Architecture::Pulley64
-            ),
-            inputs: vec![],
-        };
+        let mut ret = CompileInputs { inputs: vec![] };
 
         let module_index = StaticModuleIndex::from_u32(0);
         ret.collect_inputs_in_translations(types, [(module_index, translation, functions)]);
@@ -370,14 +361,7 @@ impl<'a> CompileInputs<'a> {
             ),
         >,
     ) -> Self {
-        let triple = engine.compiler().triple();
-        let mut ret = CompileInputs {
-            need_wasm_to_array_trampolines: !matches!(
-                triple.architecture,
-                target_lexicon::Architecture::Pulley32 | target_lexicon::Architecture::Pulley64
-            ),
-            inputs: vec![],
-        };
+        let mut ret = CompileInputs { inputs: vec![] };
 
         ret.collect_inputs_in_translations(types.module_types_builder(), module_translations);
         let tunables = engine.tunables();
@@ -389,9 +373,10 @@ impl<'a> CompileInputs<'a> {
                     symbol: trampoline.symbol_name(),
                     function: compiler
                         .component_compiler()
-                        .compile_trampoline(component, types, idx, tunables)?
+                        .compile_trampoline(component, types, idx, tunables)
+                        .with_context(|| format!("failed to compile {}", trampoline.symbol_name()))?
                         .into(),
-                    info: None,
+                    start_srcloc: FilePos::default(),
                 })
             });
         }
@@ -405,13 +390,15 @@ impl<'a> CompileInputs<'a> {
         if component.component.num_resources > 0 {
             if let Some(sig) = types.find_resource_drop_signature() {
                 ret.push_input(move |compiler| {
-                    let trampoline =
-                        compiler.compile_wasm_to_array_trampoline(types[sig].unwrap_func())?;
+                    let symbol = "resource_drop_trampoline".to_string();
+                    let trampoline = compiler
+                        .compile_wasm_to_array_trampoline(types[sig].unwrap_func())
+                        .with_context(|| format!("failed to compile `{symbol}`"))?;
                     Ok(CompileOutput {
                         key: CompileKey::resource_drop_wasm_to_array_trampoline(),
-                        symbol: "resource_drop_trampoline".to_string(),
                         function: CompiledFunction::Function(trampoline),
-                        info: None,
+                        symbol,
+                        start_srcloc: FilePos::default(),
                     })
                 });
             }
@@ -465,8 +452,6 @@ impl<'a> CompileInputs<'a> {
             for (def_func_index, func_body) in functions {
                 self.push_input(move |compiler| {
                     let func_index = translation.module.func_index(def_func_index);
-                    let (info, function) =
-                        compiler.compile_function(translation, def_func_index, func_body, types)?;
                     let symbol = match translation
                         .debuginfo
                         .name_section
@@ -485,12 +470,18 @@ impl<'a> CompileInputs<'a> {
                             func_index.as_u32()
                         ),
                     };
+                    let data = func_body.body.get_binary_reader();
+                    let offset = data.original_position();
+                    let start_srcloc = FilePos::new(u32::try_from(offset).unwrap());
+                    let function = compiler
+                        .compile_function(translation, def_func_index, func_body, types)
+                        .with_context(|| format!("failed to compile: {symbol}"))?;
 
                     Ok(CompileOutput {
                         key: CompileKey::wasm_function(module, def_func_index),
                         symbol,
                         function: CompiledFunction::Function(function),
-                        info: Some(info),
+                        start_srcloc,
                     })
                 });
 
@@ -498,48 +489,47 @@ impl<'a> CompileInputs<'a> {
                 if translation.module.functions[func_index].is_escaping() {
                     self.push_input(move |compiler| {
                         let func_index = translation.module.func_index(def_func_index);
-                        let trampoline = compiler.compile_array_to_wasm_trampoline(
-                            translation,
-                            types,
-                            def_func_index,
-                        )?;
+                        let symbol = format!(
+                            "wasm[{}]::array_to_wasm_trampoline[{}]",
+                            module.as_u32(),
+                            func_index.as_u32()
+                        );
+                        let trampoline = compiler
+                            .compile_array_to_wasm_trampoline(translation, types, def_func_index)
+                            .with_context(|| format!("failed to compile: {symbol}"))?;
                         Ok(CompileOutput {
                             key: CompileKey::array_to_wasm_trampoline(module, def_func_index),
-                            symbol: format!(
-                                "wasm[{}]::array_to_wasm_trampoline[{}]",
-                                module.as_u32(),
-                                func_index.as_u32()
-                            ),
+                            symbol,
                             function: CompiledFunction::Function(trampoline),
-                            info: None,
+                            start_srcloc: FilePos::default(),
                         })
                     });
                 }
             }
         }
 
-        if self.need_wasm_to_array_trampolines {
-            let mut trampoline_types_seen = HashSet::new();
-            for (_func_type_index, trampoline_type_index) in types.trampoline_types() {
-                let is_new = trampoline_types_seen.insert(trampoline_type_index);
-                if !is_new {
-                    continue;
-                }
-                let trampoline_func_ty = types[trampoline_type_index].unwrap_func();
-                self.push_input(move |compiler| {
-                    let trampoline =
-                        compiler.compile_wasm_to_array_trampoline(trampoline_func_ty)?;
-                    Ok(CompileOutput {
-                        key: CompileKey::wasm_to_array_trampoline(trampoline_type_index),
-                        symbol: format!(
-                            "signatures[{}]::wasm_to_array_trampoline",
-                            trampoline_type_index.as_u32()
-                        ),
-                        function: CompiledFunction::Function(trampoline),
-                        info: None,
-                    })
-                });
+        let mut trampoline_types_seen = HashSet::new();
+        for (_func_type_index, trampoline_type_index) in types.trampoline_types() {
+            let is_new = trampoline_types_seen.insert(trampoline_type_index);
+            if !is_new {
+                continue;
             }
+            let trampoline_func_ty = types[trampoline_type_index].unwrap_func();
+            self.push_input(move |compiler| {
+                let symbol = format!(
+                    "signatures[{}]::wasm_to_array_trampoline",
+                    trampoline_type_index.as_u32()
+                );
+                let trampoline = compiler
+                    .compile_wasm_to_array_trampoline(trampoline_func_ty)
+                    .with_context(|| format!("failed to compile: {symbol}"))?;
+                Ok(CompileOutput {
+                    key: CompileKey::wasm_to_array_trampoline(trampoline_type_index),
+                    function: CompiledFunction::Function(trampoline),
+                    symbol,
+                    start_srcloc: FilePos::default(),
+                })
+            });
         }
     }
 
@@ -577,9 +567,13 @@ fn compile_required_builtins(engine: &Engine, raw_outputs: &mut Vec<CompileOutpu
             let symbol = format!("wasmtime_builtin_{}", builtin.name());
             Ok(CompileOutput {
                 key: CompileKey::wasm_to_builtin_trampoline(builtin),
+                function: CompiledFunction::Function(
+                    compiler
+                        .compile_wasm_to_builtin(builtin)
+                        .with_context(|| format!("failed to compile `{symbol}`"))?,
+                ),
                 symbol,
-                function: CompiledFunction::Function(compiler.compile_wasm_to_builtin(builtin)?),
-                info: None,
+                start_srcloc: FilePos::default(),
             })
         })
     };
@@ -648,9 +642,7 @@ impl UnlinkedCompileOutputs {
                 indices
                     .compiled_func_index_to_module
                     .insert(index.unwrap_function(), x.key.module());
-                if let Some(info) = x.info {
-                    indices.wasm_function_infos.insert(x.key, info);
-                }
+                indices.start_srclocs.insert(x.key, x.start_srcloc);
             }
 
             indices
@@ -669,8 +661,8 @@ struct FunctionIndices {
     // `StaticModuleIndex` for that function.
     compiled_func_index_to_module: HashMap<usize, StaticModuleIndex>,
 
-    // A map from Wasm functions' compile keys to their infos.
-    wasm_function_infos: HashMap<CompileKey, WasmFunctionInfo>,
+    // A map of wasm functions and where they're located in the original file.
+    start_srclocs: HashMap<CompileKey, FilePos>,
 
     // The index of each compiled function, bucketed by compile key kind.
     indices: BTreeMap<u32, BTreeMap<CompileKey, CompiledFunction<usize>>>,
@@ -717,7 +709,7 @@ impl FunctionIndices {
                     [&CompileKey::WASM_TO_BUILTIN_TRAMPOLINE_KIND]
                     [&CompileKey::wasm_to_builtin_trampoline(builtin)]
                     .unwrap_function(),
-                RelocationTarget::HostLibcall(_) => {
+                RelocationTarget::HostLibcall(_) | RelocationTarget::PulleyHostcall(_) => {
                     unreachable!("relocation is resolved at runtime, not compile time");
                 }
             },
@@ -738,8 +730,7 @@ impl FunctionIndices {
             )?;
         }
 
-        let mut obj =
-            wasmtime_environ::ObjectBuilder::new(obj, tunables, compiler.triple().clone());
+        let mut obj = wasmtime_environ::ObjectBuilder::new(obj, tunables);
         let mut artifacts = Artifacts::default();
 
         // Remove this as it's not needed by anything below and we'll debug
@@ -796,7 +787,7 @@ impl FunctionIndices {
                 // can either at runtime be implemented as a single memcpy to
                 // initialize memory or otherwise enabling virtual-memory-tricks
                 // such as mmap'ing from a file to get copy-on-write.
-                if engine.config().memory_init_cow {
+                if engine.tunables().memory_init_cow {
                     let align = compiler.page_size_align();
                     let max_always_allowed = engine.config().memory_guaranteed_dense_image_size;
                     translation.try_static_init(align, max_always_allowed);
@@ -814,7 +805,7 @@ impl FunctionIndices {
                         .map(|(key, wasm_func_index)| {
                             let wasm_func_index = wasm_func_index.unwrap_function();
                             let wasm_func_loc = symbol_ids_and_locs[wasm_func_index].1;
-                            let wasm_func_info = self.wasm_function_infos.remove(&key).unwrap();
+                            let start_srcloc = self.start_srclocs.remove(&key).unwrap();
 
                             let array_to_wasm_trampoline = array_to_wasm_trampolines
                                 .remove(&CompileKey::array_to_wasm_trampoline(
@@ -824,36 +815,30 @@ impl FunctionIndices {
                                 .map(|x| symbol_ids_and_locs[x.unwrap_function()].1);
 
                             CompiledFunctionInfo {
-                                wasm_func_info,
+                                start_srcloc,
                                 wasm_func_loc,
                                 array_to_wasm_trampoline,
                             }
                         })
                         .collect();
 
-                let wasm_to_array_trampolines = match engine.compiler().triple().architecture {
-                    target_lexicon::Architecture::Pulley32
-                    | target_lexicon::Architecture::Pulley64 => vec![],
-                    _ => {
-                        let unique_and_sorted_trampoline_sigs = translation
-                            .module
-                            .types
-                            .iter()
-                            .map(|(_, ty)| *ty)
-                            .filter(|idx| types[*idx].is_func())
-                            .map(|idx| types.trampoline_type(idx))
-                            .collect::<BTreeSet<_>>();
-                        unique_and_sorted_trampoline_sigs
-                            .iter()
-                            .map(|idx| {
-                                let trampoline = types.trampoline_type(*idx);
-                                let key = CompileKey::wasm_to_array_trampoline(trampoline);
-                                let compiled = wasm_to_array_trampolines[&key];
-                                (*idx, symbol_ids_and_locs[compiled.unwrap_function()].1)
-                            })
-                            .collect()
-                    }
-                };
+                let unique_and_sorted_trampoline_sigs = translation
+                    .module
+                    .types
+                    .iter()
+                    .map(|(_, ty)| ty.unwrap_module_type_index())
+                    .filter(|idx| types[*idx].is_func())
+                    .map(|idx| types.trampoline_type(idx))
+                    .collect::<BTreeSet<_>>();
+                let wasm_to_array_trampolines = unique_and_sorted_trampoline_sigs
+                    .iter()
+                    .map(|idx| {
+                        let trampoline = types.trampoline_type(*idx);
+                        let key = CompileKey::wasm_to_array_trampoline(trampoline);
+                        let compiled = wasm_to_array_trampolines[&key];
+                        (*idx, symbol_ids_and_locs[compiled.unwrap_function()].1)
+                    })
+                    .collect();
 
                 obj.append(translation, funcs, wasm_to_array_trampolines)
             })

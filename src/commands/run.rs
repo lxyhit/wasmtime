@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use wasi_common::sync::{ambient_authority, Dir, TcpListener, WasiCtxBuilder};
 use wasmtime::{Engine, Func, Module, Store, StoreLimits, Val, ValType};
-use wasmtime_wasi::WasiView;
+use wasmtime_wasi::{IoView, WasiView};
 
 #[cfg(feature = "wasi-nn")]
 use wasmtime_wasi_nn::wit::WasiNnView;
@@ -26,9 +26,14 @@ use wasmtime_wasi_threads::WasiThreadsCtx;
 #[cfg(feature = "wasi-config")]
 use wasmtime_wasi_config::{WasiConfig, WasiConfigVariables};
 #[cfg(feature = "wasi-http")]
-use wasmtime_wasi_http::WasiHttpCtx;
+use wasmtime_wasi_http::{
+    WasiHttpCtx, DEFAULT_OUTGOING_BODY_BUFFER_CHUNKS, DEFAULT_OUTGOING_BODY_CHUNK_SIZE,
+};
 #[cfg(feature = "wasi-keyvalue")]
 use wasmtime_wasi_keyvalue::{WasiKeyValue, WasiKeyValueCtx, WasiKeyValueCtxBuilder};
+
+#[cfg(feature = "wasi-tls")]
+use wasmtime_wasi_tls::WasiTlsCtx;
 
 fn parse_preloads(s: &str) -> Result<(String, PathBuf)> {
     let parts: Vec<&str> = s.splitn(2, '=').collect();
@@ -39,10 +44,10 @@ fn parse_preloads(s: &str) -> Result<(String, PathBuf)> {
 }
 
 /// Runs a WebAssembly module
-#[derive(Parser, PartialEq)]
+#[derive(Parser)]
 pub struct RunCommand {
     #[command(flatten)]
-    #[allow(missing_docs)]
+    #[expect(missing_docs, reason = "don't want to mess with clap doc-strings")]
     pub run: RunCommon,
 
     /// The name of the function to run
@@ -87,7 +92,7 @@ impl RunCommand {
     pub fn execute(mut self) -> Result<()> {
         self.run.common.init_logging()?;
 
-        let mut config = self.run.common.config(None, None)?;
+        let mut config = self.run.common.config(None)?;
         config.async_support(true);
 
         if self.run.common.wasm.timeout.is_some() {
@@ -137,7 +142,18 @@ impl RunCommand {
             }
         }
 
-        let host = Host::default();
+        let host = Host {
+            #[cfg(feature = "wasi-http")]
+            wasi_http_outgoing_body_buffer_chunks: self
+                .run
+                .common
+                .wasi
+                .http_outgoing_body_buffer_chunks,
+            #[cfg(feature = "wasi-http")]
+            wasi_http_outgoing_body_chunk_size: self.run.common.wasi.http_outgoing_body_chunk_size,
+            ..Default::default()
+        };
+
         let mut store = Store::new(&engine, host);
         self.populate_with_wasi(&mut linker, &mut store, &main)?;
 
@@ -510,11 +526,17 @@ impl RunCommand {
                 .to_str()
                 .ok_or_else(|| anyhow!("argument is not valid utf-8: {val:?}"))?;
             values.push(match ty {
-                // TODO: integer parsing here should handle hexadecimal notation
-                // like `0x0...`, but the Rust standard library currently only
-                // parses base-10 representations.
-                ValType::I32 => Val::I32(val.parse()?),
-                ValType::I64 => Val::I64(val.parse()?),
+                // Supports both decimal and hexadecimal notation (with 0x prefix)
+                ValType::I32 => Val::I32(if val.starts_with("0x") || val.starts_with("0X") {
+                    i32::from_str_radix(&val[2..], 16)?
+                } else {
+                    val.parse::<i32>()?
+                }),
+                ValType::I64 => Val::I64(if val.starts_with("0x") || val.starts_with("0X") {
+                    i64::from_str_radix(&val[2..], 16)?
+                } else {
+                    val.parse::<i64>()?
+                }),
                 ValType::F32 => Val::F32(val.parse::<f32>()?.to_bits()),
                 ValType::F64 => Val::F64(val.parse::<f64>()?.to_bits()),
                 t => bail!("unsupported argument type {:?}", t),
@@ -812,6 +834,32 @@ impl RunCommand {
             }
         }
 
+        if self.run.common.wasi.tls == Some(true) {
+            #[cfg(all(not(all(feature = "wasi-tls", feature = "component-model"))))]
+            {
+                bail!("Cannot enable wasi-tls when the binary is not compiled with this feature.");
+            }
+            #[cfg(all(feature = "wasi-tls", feature = "component-model",))]
+            {
+                match linker {
+                    CliLinker::Core(_) => {
+                        bail!("Cannot enable wasi-tls for core wasm modules");
+                    }
+                    CliLinker::Component(linker) => {
+                        let mut opts = wasmtime_wasi_tls::LinkOptions::default();
+                        opts.tls(true);
+                        wasmtime_wasi_tls::add_to_linker(linker, &mut opts, |h| {
+                            let preview2_ctx =
+                                h.preview2_ctx.as_mut().expect("wasip2 is not configured");
+                            let preview2_ctx =
+                                Arc::get_mut(preview2_ctx).unwrap().get_mut().unwrap();
+                            WasiTlsCtx::new(preview2_ctx.table())
+                        })?;
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -905,6 +953,10 @@ struct Host {
     wasi_threads: Option<Arc<WasiThreadsCtx<Host>>>,
     #[cfg(feature = "wasi-http")]
     wasi_http: Option<Arc<WasiHttpCtx>>,
+    #[cfg(feature = "wasi-http")]
+    wasi_http_outgoing_body_buffer_chunks: Option<usize>,
+    #[cfg(feature = "wasi-http")]
+    wasi_http_outgoing_body_chunk_size: Option<usize>,
     limits: StoreLimits,
     #[cfg(feature = "profiling")]
     guest_profiler: Option<Arc<wasmtime::GuestProfiler>>,
@@ -928,11 +980,12 @@ impl Host {
     }
 }
 
-impl WasiView for Host {
+impl IoView for Host {
     fn table(&mut self) -> &mut wasmtime::component::ResourceTable {
         self.preview2_ctx().table()
     }
-
+}
+impl WasiView for Host {
     fn ctx(&mut self) -> &mut wasmtime_wasi::WasiCtx {
         self.preview2_ctx().ctx()
     }
@@ -945,8 +998,14 @@ impl wasmtime_wasi_http::types::WasiHttpView for Host {
         Arc::get_mut(ctx).expect("wasmtime_wasi is not compatible with threads")
     }
 
-    fn table(&mut self) -> &mut wasmtime::component::ResourceTable {
-        self.preview2_ctx().table()
+    fn outgoing_body_buffer_chunks(&mut self) -> usize {
+        self.wasi_http_outgoing_body_buffer_chunks
+            .unwrap_or_else(|| DEFAULT_OUTGOING_BODY_BUFFER_CHUNKS)
+    }
+
+    fn outgoing_body_chunk_size(&mut self) -> usize {
+        self.wasi_http_outgoing_body_chunk_size
+            .unwrap_or_else(|| DEFAULT_OUTGOING_BODY_CHUNK_SIZE)
     }
 }
 

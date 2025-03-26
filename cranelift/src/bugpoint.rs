@@ -55,7 +55,9 @@ pub fn run(options: &Options) -> Result<()> {
         anyhow::bail!("compilation requires a target isa");
     };
 
-    std::env::set_var("RUST_BACKTRACE", "0"); // Disable backtraces to reduce verbosity
+    unsafe {
+        std::env::set_var("RUST_BACKTRACE", "0"); // Disable backtraces to reduce verbosity
+    }
 
     for (func, _) in test_file.functions {
         let (orig_block_count, orig_inst_count) = (block_count(&func), inst_count(&func));
@@ -987,7 +989,7 @@ impl<'a> CrashCheckContext<'a> {
         }
     }
 
-    #[cfg_attr(test, allow(unreachable_code))]
+    #[cfg_attr(test, expect(unreachable_code, reason = "test-specific code"))]
     fn check_for_crash(&mut self, func: &Function) -> CheckResult {
         self.context.clear();
 

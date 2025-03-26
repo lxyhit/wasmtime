@@ -5,7 +5,7 @@ use anyhow::Result;
 use std::rc::Rc;
 use std::sync::Arc;
 use wasmtime::component::*;
-use wasmtime::{Config, Engine, Store, StoreContextMut, Trap};
+use wasmtime::{Engine, Store, StoreContextMut, Trap};
 
 const CANON_32BIT_NAN: u32 = 0b01111111110000000000000000000000;
 const CANON_64BIT_NAN: u64 = 0b0111111111111000000000000000000000000000000000000000000000000000;
@@ -68,7 +68,7 @@ fn typecheck() -> Result<()> {
             (func (export "take-two-args") (param "a" s32) (param "b" (list u8))
                 (canon lift (core func $i "two-args") (memory $i "memory") (realloc (func $i "realloc")))
             )
-            (func (export "ret-tuple") (result "a" u8) (result "b" s8)
+            (func (export "ret-tuple") (result (tuple u8 s8))
                 (canon lift (core func $i "ret-one") (memory $i "memory") (realloc (func $i "realloc")))
             )
             (func (export "ret-tuple1") (result (tuple u32))
@@ -83,9 +83,7 @@ fn typecheck() -> Result<()> {
         )
     "#;
 
-    let mut config = Config::new();
-    config.wasm_component_model_multiple_returns(true);
-    let engine = Engine::new(&config)?;
+    let engine = Engine::default();
     let component = Component::new(&engine, component)?;
     let mut store = Store::new(&engine, ());
     let instance = Linker::new(&engine).instantiate(&mut store, &component)?;
@@ -109,7 +107,7 @@ fn typecheck() -> Result<()> {
     assert!(take_two_args.typed::<(i32, &[u8]), ()>(&store).is_ok());
     assert!(ret_tuple.typed::<(), ()>(&store).is_err());
     assert!(ret_tuple.typed::<(), (u8,)>(&store).is_err());
-    assert!(ret_tuple.typed::<(), (u8, i8)>(&store).is_ok());
+    assert!(ret_tuple.typed::<(), ((u8, i8),)>(&store).is_ok());
     assert!(ret_tuple1.typed::<(), ((u32,),)>(&store).is_ok());
     assert!(ret_tuple1.typed::<(), (u32,)>(&store).is_err());
     assert!(ret_string.typed::<(), ()>(&store).is_err());
@@ -503,7 +501,7 @@ fn floats() -> Result<()> {
             .call(&mut store, (CANON_32BIT_NAN | 1,))?
             .0
             .to_bits(),
-        CANON_32BIT_NAN
+        CANON_32BIT_NAN | 1
     );
     u32_to_f32.post_return(&mut store)?;
     assert_eq!(
@@ -511,18 +509,18 @@ fn floats() -> Result<()> {
             .call(&mut store, (CANON_64BIT_NAN | 1,))?
             .0
             .to_bits(),
-        CANON_64BIT_NAN,
+        CANON_64BIT_NAN | 1,
     );
     u64_to_f64.post_return(&mut store)?;
 
     assert_eq!(
         f32_to_u32.call(&mut store, (f32::from_bits(CANON_32BIT_NAN | 1),))?,
-        (CANON_32BIT_NAN,)
+        (CANON_32BIT_NAN | 1,)
     );
     f32_to_u32.post_return(&mut store)?;
     assert_eq!(
         f64_to_u64.call(&mut store, (f64::from_bits(CANON_64BIT_NAN | 1),))?,
-        (CANON_64BIT_NAN,)
+        (CANON_64BIT_NAN | 1,)
     );
     f64_to_u64.post_return(&mut store)?;
 
@@ -937,7 +935,10 @@ fn many_parameters() -> Result<()> {
     assert_eq!(i8::from_le_bytes(*actual.take_n::<1>()), input.0);
     actual.skip::<7>();
     assert_eq!(u64::from_le_bytes(*actual.take_n::<8>()), input.1);
-    assert_eq!(u32::from_le_bytes(*actual.take_n::<4>()), CANON_32BIT_NAN);
+    assert_eq!(
+        u32::from_le_bytes(*actual.take_n::<4>()),
+        CANON_32BIT_NAN | 1
+    );
     assert_eq!(u8::from_le_bytes(*actual.take_n::<1>()), input.3);
     actual.skip::<1>();
     assert_eq!(i16::from_le_bytes(*actual.take_n::<2>()), input.4);
@@ -1703,7 +1704,7 @@ fn expected() -> Result<()> {
     let ret = to_expected_s16_f32
         .call(&mut store, (1, CANON_32BIT_NAN | 1))?
         .0;
-    assert_eq!(ret.unwrap_err().to_bits(), CANON_32BIT_NAN);
+    assert_eq!(ret.unwrap_err().to_bits(), CANON_32BIT_NAN | 1);
     to_expected_s16_f32.post_return(&mut store)?;
     assert!(to_expected_s16_f32.call(&mut store, (2, 0)).is_err());
 

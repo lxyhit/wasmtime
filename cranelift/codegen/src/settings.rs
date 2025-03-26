@@ -167,7 +167,7 @@ impl Builder {
     }
 
     /// Iterates the available settings in the builder.
-    pub fn iter(&self) -> impl Iterator<Item = Setting> {
+    pub fn iter(&self) -> impl Iterator<Item = Setting> + use<> {
         let template = self.template;
 
         template.descriptors.iter().map(move |d| {
@@ -509,6 +509,7 @@ mod tests {
         let f = Flags::new(b);
         let actual = f.to_string();
         let expected = r#"[shared]
+regalloc_algorithm = "backtracking"
 opt_level = "none"
 tls_model = "none"
 stack_switch_model = "none"
@@ -516,6 +517,7 @@ libcall_call_conv = "isa_default"
 probestack_size_log2 = 12
 probestack_strategy = "outline"
 bb_padding_log2_minus_one = 0
+log2_min_function_alignment = 0
 regalloc_checker = false
 regalloc_verbose_logs = false
 enable_alias_analysis = true

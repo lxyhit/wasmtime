@@ -37,6 +37,7 @@ pub unsafe fn commit_pages(addr: *mut u8, len: usize) -> io::Result<()> {
     expose_existing_mapping(addr, len)
 }
 
+#[cfg(feature = "pooling-allocator")]
 pub unsafe fn decommit_pages(addr: *mut u8, len: usize) -> io::Result<()> {
     erase_existing_mapping(addr, len)
 }
@@ -63,10 +64,6 @@ impl MemoryImageSource {
 
     pub fn from_data(_data: &[u8]) -> io::Result<Option<MemoryImageSource>> {
         Ok(None)
-    }
-
-    pub unsafe fn map_at(&self, _base: *mut u8, _len: usize, _offset: u64) -> io::Result<()> {
-        match *self {}
     }
 
     pub unsafe fn remap_as_zeros_at(&self, _base: *mut u8, _len: usize) -> io::Result<()> {

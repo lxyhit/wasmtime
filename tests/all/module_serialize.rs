@@ -1,5 +1,5 @@
 use anyhow::bail;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use wasmtime::*;
 
 fn serialize(engine: &Engine, wat: &str) -> Result<Vec<u8>> {
@@ -103,6 +103,23 @@ fn test_deserialize_from_file() -> Result<()> {
         let instance = Instance::new(&mut store, &module, &[])?;
         let func = instance.get_typed_func::<(), i32>(&mut store, "run")?;
         assert_eq!(func.call(&mut store, ())?, 42);
+
+        // Try an already opened file as well.
+        let mut open_options = OpenOptions::new();
+        open_options.read(true);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::prelude::*;
+            use windows_sys::Win32::Storage::FileSystem::*;
+            open_options.access_mode(FILE_GENERIC_READ | FILE_GENERIC_EXECUTE);
+        }
+
+        let file = open_options.open(&path)?;
+        let module = unsafe { Module::deserialize_open_file(store.engine(), file)? };
+        let instance = Instance::new(&mut store, &module, &[])?;
+        let func = instance.get_typed_func::<(), i32>(&mut store, "run")?;
+        assert_eq!(func.call(&mut store, ())?, 42);
+
         Ok(())
     }
 }
@@ -128,10 +145,10 @@ fn detect_precompiled() -> Result<()> {
         &engine,
         "(module (func (export \"run\") (result i32) i32.const 42))",
     )?;
-    assert_eq!(engine.detect_precompiled(&[]), None);
-    assert_eq!(engine.detect_precompiled(&buffer[..5]), None);
+    assert_eq!(Engine::detect_precompiled(&[]), None);
+    assert_eq!(Engine::detect_precompiled(&buffer[..5]), None);
     assert_eq!(
-        engine.detect_precompiled(&buffer),
+        Engine::detect_precompiled(&buffer),
         Some(Precompiled::Module)
     );
     Ok(())

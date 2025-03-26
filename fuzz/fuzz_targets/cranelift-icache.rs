@@ -43,6 +43,8 @@ pub struct FunctionWithIsa {
 
 impl FunctionWithIsa {
     pub fn generate(u: &mut Unstructured) -> anyhow::Result<Self> {
+        let _ = env_logger::try_init();
+
         // We filter out targets that aren't supported in the current build
         // configuration after randomly choosing one, instead of randomly choosing
         // a supported one, so that the same fuzz input works across different build
@@ -52,11 +54,11 @@ impl FunctionWithIsa {
             isa::lookup_by_name(target).map_err(|_| arbitrary::Error::IncorrectFormat)?;
         let architecture = builder.triple().architecture;
 
-        let mut gen = FuzzGen::new(u);
-        let flags = gen
+        let mut generator = FuzzGen::new(u);
+        let flags = generator
             .generate_flags(architecture)
             .map_err(|_| arbitrary::Error::IncorrectFormat)?;
-        gen.set_isa_flags(&mut builder, IsaFlagGen::All)?;
+        generator.set_isa_flags(&mut builder, IsaFlagGen::All)?;
         let isa = builder
             .finish(flags)
             .map_err(|_| arbitrary::Error::IncorrectFormat)?;
@@ -65,17 +67,19 @@ impl FunctionWithIsa {
         let fname = UserFuncName::user(1, 0);
 
         // We don't actually generate these functions, we just simulate their signatures and names
-        let func_count = gen.u.int_in_range(gen.config.testcase_funcs.clone())?;
+        let func_count = generator
+            .u
+            .int_in_range(generator.config.testcase_funcs.clone())?;
         let usercalls = (0..func_count)
             .map(|i| {
                 let name = UserExternalName::new(2, i as u32);
-                let sig = gen.generate_signature(&*isa)?;
+                let sig = generator.generate_signature(&*isa)?;
                 Ok((name, sig))
             })
             .collect::<anyhow::Result<Vec<(UserExternalName, Signature)>>>()
             .map_err(|_| arbitrary::Error::IncorrectFormat)?;
 
-        let func = gen
+        let func = generator
             .generate_func(fname, isa.clone(), usercalls, ALLOWED_LIBCALLS.to_vec())
             .map_err(|_| arbitrary::Error::IncorrectFormat)?;
 

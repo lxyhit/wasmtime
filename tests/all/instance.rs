@@ -1,6 +1,7 @@
 use wasmtime::*;
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn wrong_import_numbers() -> Result<()> {
     let mut store = Store::<()>::default();
     let module = Module::new(store.engine(), r#"(module (import "" "" (func)))"#)?;
@@ -34,6 +35,7 @@ fn initializes_linear_memory() -> Result<()> {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(target_pointer_width = "64")]
 fn linear_memory_limits() -> Result<()> {
     // this test will allocate 4GB of virtual memory space, and may not work in
     // situations like CI QEMU emulation where it triggers SIGKILL.

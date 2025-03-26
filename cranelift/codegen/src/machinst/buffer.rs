@@ -152,7 +152,7 @@
 //!   but is conservative.
 //!
 //! - The fixup list can interact with island emission to create
-//!   "quadratic island behvior". In a little more detail, one can hit
+//!   "quadratic island behavior". In a little more detail, one can hit
 //!   this behavior by having some pending fixups (forward label
 //!   references) with long-range label-use kinds, and some others
 //!   with shorter-range references that nonetheless still are pending
@@ -239,6 +239,8 @@ enum ForceVeneers {
 pub struct MachBuffer<I: VCodeInst> {
     /// The buffer contents, as raw bytes.
     data: SmallVec<[u8; 1024]>,
+    /// The required alignment of this buffer.
+    min_alignment: u32,
     /// Any relocations referring to this code. Note that only *external*
     /// relocations are tracked here; references to labels within the buffer are
     /// resolved before emission.
@@ -392,11 +394,6 @@ impl MachLabel {
         MachLabel(bindex.index() as u32)
     }
 
-    /// Get the numeric label index.
-    pub fn get(self) -> u32 {
-        self.0
-    }
-
     /// Creates a string representing this label, for convenience.
     pub fn to_string(&self) -> String {
         format!("label{}", self.0)
@@ -438,6 +435,7 @@ impl<I: VCodeInst> MachBuffer<I> {
     pub fn new() -> MachBuffer<I> {
         MachBuffer {
             data: SmallVec::new(),
+            min_alignment: I::function_alignment().minimum,
             relocs: SmallVec::new(),
             traps: SmallVec::new(),
             call_sites: SmallVec::new(),
@@ -612,7 +610,7 @@ impl<I: VCodeInst> MachBuffer<I> {
     /// at the ISA's minimum function alignment and can be increased due to
     /// constant requirements.
     fn finish_constants(&mut self, constants: &VCodeConstants) -> u32 {
-        let mut alignment = I::function_alignment().minimum;
+        let mut alignment = self.min_alignment;
         for (constant, offset) in mem::take(&mut self.used_constants) {
             let constant = constants.get(constant);
             let data = constant.as_slice();
@@ -1536,7 +1534,7 @@ impl<I: VCodeInst> MachBuffer<I> {
         }
     }
 
-    /// Add an external relocation at the given offset from current offset.
+    /// Add an external relocation at the given offset.
     pub fn add_reloc_at_offset<T: Into<RelocTarget> + Clone>(
         &mut self,
         offset: CodeOffset,
@@ -1579,7 +1577,7 @@ impl<I: VCodeInst> MachBuffer<I> {
         // when a relocation can't otherwise be resolved later, so it shouldn't
         // actually result in any memory unsafety or anything like that.
         self.relocs.push(MachReloc {
-            offset: self.data.len() as CodeOffset + offset,
+            offset,
             kind,
             target,
             addend,
@@ -1593,7 +1591,7 @@ impl<I: VCodeInst> MachBuffer<I> {
         target: &T,
         addend: Addend,
     ) {
-        self.add_reloc_at_offset(0, kind, target, addend);
+        self.add_reloc_at_offset(self.data.len() as CodeOffset, kind, target, addend);
     }
 
     /// Add a trap record at the current offset.
@@ -1669,6 +1667,15 @@ impl<I: VCodeInst> MachBuffer<I> {
 
         stack_map.finalize(emit_state.frame_layout().sp_to_sized_stack_slots());
         self.user_stack_maps.push((return_addr, span, stack_map));
+    }
+
+    /// Increase the alignment of the buffer to the given alignment if bigger
+    /// than the current alignment.
+    pub fn set_log2_min_function_alignment(&mut self, align_to: u8) {
+        self.min_alignment = self.min_alignment.max(
+            1u32.checked_shl(u32::from(align_to))
+                .expect("log2_min_function_alignment too large"),
+        );
     }
 }
 
@@ -2037,6 +2044,10 @@ impl<I: VCodeInst> TextSectionBuilder for MachTextSectionBuilder<I> {
         self.force_veneers = ForceVeneers::Yes;
     }
 
+    fn write(&mut self, offset: u64, data: &[u8]) {
+        self.buf.data[offset.try_into().unwrap()..][..data.len()].copy_from_slice(data);
+    }
+
     fn finish(&mut self, ctrl_plane: &mut ControlPlane) -> Vec<u8> {
         // Double-check all functions were pushed.
         assert_eq!(self.next_func, self.buf.label_offsets.len());
@@ -2057,7 +2068,7 @@ mod test {
 
     use super::*;
     use crate::ir::UserExternalNameRef;
-    use crate::isa::aarch64::inst::xreg;
+    use crate::isa::aarch64::inst::{xreg, OperandSize};
     use crate::isa::aarch64::inst::{BranchTarget, CondBrKind, EmitInfo, Inst};
     use crate::machinst::{MachInstEmit, MachInstEmitState};
     use crate::settings;
@@ -2096,7 +2107,7 @@ mod test {
 
         buf.bind_label(label(0), state.ctrl_plane_mut());
         let inst = Inst::CondBr {
-            kind: CondBrKind::NotZero(xreg(0)),
+            kind: CondBrKind::NotZero(xreg(0), OperandSize::Size64),
             taken: target(1),
             not_taken: target(2),
         };
@@ -2127,7 +2138,7 @@ mod test {
 
         buf.bind_label(label(0), state.ctrl_plane_mut());
         let inst = Inst::CondBr {
-            kind: CondBrKind::Zero(xreg(0)),
+            kind: CondBrKind::Zero(xreg(0), OperandSize::Size64),
             taken: target(1),
             not_taken: target(2),
         };
@@ -2150,7 +2161,7 @@ mod test {
         let mut buf2 = MachBuffer::new();
         let mut state = Default::default();
         let inst = Inst::TrapIf {
-            kind: CondBrKind::NotZero(xreg(0)),
+            kind: CondBrKind::NotZero(xreg(0), OperandSize::Size64),
             trap_code: TrapCode::STACK_OVERFLOW,
         };
         inst.emit(&mut buf2, &info, &mut state);
@@ -2173,7 +2184,7 @@ mod test {
 
         buf.bind_label(label(0), state.ctrl_plane_mut());
         let inst = Inst::CondBr {
-            kind: CondBrKind::NotZero(xreg(0)),
+            kind: CondBrKind::NotZero(xreg(0), OperandSize::Size64),
             taken: target(2),
             not_taken: target(3),
         };
@@ -2203,7 +2214,7 @@ mod test {
         let mut buf2 = MachBuffer::new();
         let mut state = Default::default();
         let inst = Inst::CondBr {
-            kind: CondBrKind::NotZero(xreg(0)),
+            kind: CondBrKind::NotZero(xreg(0), OperandSize::Size64),
 
             // This conditionally taken branch has a 19-bit constant, shifted
             // to the left by two, giving us a 21-bit range in total. Half of
@@ -2256,7 +2267,7 @@ mod test {
 
         buf.bind_label(label(3), state.ctrl_plane_mut());
         let inst = Inst::CondBr {
-            kind: CondBrKind::NotZero(xreg(0)),
+            kind: CondBrKind::NotZero(xreg(0), OperandSize::Size64),
             taken: target(0),
             not_taken: target(1),
         };
@@ -2269,7 +2280,7 @@ mod test {
         let mut buf2 = MachBuffer::new();
         let mut state = Default::default();
         let inst = Inst::CondBr {
-            kind: CondBrKind::NotZero(xreg(0)),
+            kind: CondBrKind::NotZero(xreg(0), OperandSize::Size64),
             taken: BranchTarget::ResolvedOffset(8),
             not_taken: BranchTarget::ResolvedOffset(4 - (2000000 + 4)),
         };
@@ -2328,7 +2339,7 @@ mod test {
 
         buf.bind_label(label(0), state.ctrl_plane_mut());
         let inst = Inst::CondBr {
-            kind: CondBrKind::Zero(xreg(0)),
+            kind: CondBrKind::Zero(xreg(0), OperandSize::Size64),
             taken: target(1),
             not_taken: target(2),
         };

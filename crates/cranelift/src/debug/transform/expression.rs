@@ -1,14 +1,18 @@
-#![allow(trivial_numeric_casts)]
-
 use super::address_transform::AddressTransform;
+use super::dbi_log;
+use crate::debug::transform::debug_transform_logging::{
+    dbi_log_enabled, log_get_value_loc, log_get_value_name, log_get_value_ranges,
+};
 use crate::debug::ModuleMemoryOffset;
 use crate::translate::get_vmctx_value_label;
 use anyhow::{Context, Error, Result};
+use core::fmt;
 use cranelift_codegen::ir::ValueLabel;
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::LabelValueLoc;
 use cranelift_codegen::ValueLabelsRanges;
 use gimli::{write, Expression, Operation, Reader, ReaderOffset};
+use itertools::Itertools;
 use std::cmp::PartialEq;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -223,6 +227,11 @@ fn append_memory_deref(
     Ok(true)
 }
 
+pub struct BuiltCompiledExpression<TIter> {
+    pub expressions: TIter,
+    pub covers_entire_scope: bool,
+}
+
 impl CompiledExpression {
     pub fn is_simple(&self) -> bool {
         if let [CompiledExpressionPart::Code(_)] = self.parts.as_slice() {
@@ -246,7 +255,9 @@ impl CompiledExpression {
         addr_tr: &'a AddressTransform,
         frame_info: Option<&'a FunctionFrameInfo>,
         isa: &'a dyn TargetIsa,
-    ) -> impl Iterator<Item = Result<(write::Address, u64, write::Expression)>> + 'a {
+    ) -> BuiltCompiledExpression<
+        impl Iterator<Item = Result<(write::Address, u64, write::Expression)>> + use<'a>,
+    > {
         enum BuildWithLocalsResult<'a> {
             Empty,
             Simple(
@@ -280,25 +291,31 @@ impl CompiledExpression {
         }
 
         if scope.is_empty() {
-            return BuildWithLocalsResult::Empty;
+            return BuiltCompiledExpression {
+                expressions: BuildWithLocalsResult::Empty,
+                covers_entire_scope: false,
+            };
         }
 
         // If it a simple DWARF code, no need in locals processing. Just translate
         // the scope ranges.
         if let [CompiledExpressionPart::Code(code)] = self.parts.as_slice() {
-            return BuildWithLocalsResult::Simple(
-                Box::new(scope.iter().flat_map(move |(wasm_start, wasm_end)| {
-                    addr_tr.translate_ranges(*wasm_start, *wasm_end)
-                })),
-                code.clone(),
-            );
+            return BuiltCompiledExpression {
+                expressions: BuildWithLocalsResult::Simple(
+                    Box::new(scope.iter().flat_map(move |(wasm_start, wasm_end)| {
+                        addr_tr.translate_ranges(*wasm_start, *wasm_end)
+                    })),
+                    code.clone(),
+                ),
+                covers_entire_scope: false,
+            };
         }
 
         let vmctx_label = get_vmctx_value_label();
 
         // Some locals are present, preparing and divided ranges based on the scope
         // and frame_info data.
-        let mut ranges_builder = ValueLabelRangesBuilder::new(scope, addr_tr, frame_info);
+        let mut ranges_builder = ValueLabelRangesBuilder::new(scope, addr_tr, frame_info, isa);
         for p in self.parts.iter() {
             match p {
                 CompiledExpressionPart::Code(_)
@@ -311,10 +328,11 @@ impl CompiledExpression {
         if self.need_deref {
             ranges_builder.process_label(vmctx_label);
         }
-        let ranges = ranges_builder.into_ranges();
 
-        return BuildWithLocalsResult::Ranges(Box::new(
+        let ranges = ranges_builder.into_ranges();
+        let expressions = BuildWithLocalsResult::Ranges(Box::new(
             ranges
+                .ranges
                 .into_iter()
                 .map(
                     move |CachedValueLabelRange {
@@ -398,6 +416,11 @@ impl CompiledExpression {
                 )
                 .filter_map(Result::transpose),
         ));
+
+        BuiltCompiledExpression {
+            expressions,
+            covers_entire_scope: ranges.covers_entire_scope,
+        }
     }
 }
 
@@ -653,10 +676,45 @@ struct CachedValueLabelRange {
     label_location: HashMap<ValueLabel, LabelValueLoc>,
 }
 
+struct BuiltRangeSummary<'a> {
+    range: &'a CachedValueLabelRange,
+    isa: &'a dyn TargetIsa,
+}
+
+impl<'a> fmt::Debug for BuiltRangeSummary<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let range = self.range;
+        write!(f, "[")?;
+        let mut is_first = true;
+        for (value, value_loc) in &range.label_location {
+            if !is_first {
+                write!(f, ", ")?;
+            } else {
+                is_first = false;
+            }
+            write!(
+                f,
+                "{:?}:{:?}",
+                log_get_value_name(*value),
+                log_get_value_loc(*value_loc, self.isa)
+            )?;
+        }
+        write!(f, "]@[{}..{})", range.start, range.end)?;
+        Ok(())
+    }
+}
+
 struct ValueLabelRangesBuilder<'a, 'b> {
+    isa: &'a dyn TargetIsa,
     ranges: Vec<CachedValueLabelRange>,
     frame_info: Option<&'a FunctionFrameInfo<'b>>,
     processed_labels: HashSet<ValueLabel>,
+    covers_entire_scope: bool,
+}
+
+struct BuiltValueLabelRanges<TIter> {
+    ranges: TIter,
+    covers_entire_scope: bool,
 }
 
 impl<'a, 'b> ValueLabelRangesBuilder<'a, 'b> {
@@ -664,6 +722,7 @@ impl<'a, 'b> ValueLabelRangesBuilder<'a, 'b> {
         scope: &[(u64, u64)], // wasm ranges
         addr_tr: &'a AddressTransform,
         frame_info: Option<&'a FunctionFrameInfo<'b>>,
+        isa: &'a dyn TargetIsa,
     ) -> Self {
         let mut ranges = Vec::new();
         for (wasm_start, wasm_end) in scope {
@@ -677,10 +736,21 @@ impl<'a, 'b> ValueLabelRangesBuilder<'a, 'b> {
             }
         }
         ranges.sort_unstable_by(|a, b| a.start.cmp(&b.start));
+
+        dbi_log!(
+            "Building ranges for values in scope: {}\n{:?}",
+            ranges
+                .iter()
+                .map(|r| format!("[{}..{})", r.start, r.end))
+                .join(" "),
+            log_get_value_ranges(frame_info.map(|f| f.value_ranges), isa)
+        );
         ValueLabelRangesBuilder {
+            isa,
             ranges,
             frame_info,
             processed_labels: HashSet::new(),
+            covers_entire_scope: true,
         }
     }
 
@@ -688,6 +758,7 @@ impl<'a, 'b> ValueLabelRangesBuilder<'a, 'b> {
         if self.processed_labels.contains(&label) {
             return;
         }
+        dbi_log!("Intersecting with {:?}", log_get_value_name(label));
         self.processed_labels.insert(label);
 
         let value_ranges = match self.frame_info.and_then(|fi| fi.value_ranges.get(&label)) {
@@ -733,6 +804,7 @@ impl<'a, 'b> ValueLabelRangesBuilder<'a, 'b> {
                     ranges[i].end = range_end;
                     tail.start = range_end;
                     ranges.insert(i + 1, tail);
+                    self.covers_entire_scope = false;
                 }
                 assert!(ranges[i].end <= range_end);
                 if range_start <= ranges[i].start {
@@ -745,16 +817,37 @@ impl<'a, 'b> ValueLabelRangesBuilder<'a, 'b> {
                 tail.start = range_start;
                 tail.label_location.insert(label, loc);
                 ranges.insert(i + 1, tail);
+                self.covers_entire_scope = false;
             }
         }
     }
 
-    pub fn into_ranges(self) -> impl Iterator<Item = CachedValueLabelRange> {
+    pub fn into_ranges(
+        self,
+    ) -> BuiltValueLabelRanges<impl Iterator<Item = CachedValueLabelRange> + use<>> {
         // Ranges with not-enough labels are discarded.
         let processed_labels_len = self.processed_labels.len();
-        self.ranges
-            .into_iter()
-            .filter(move |r| r.label_location.len() == processed_labels_len)
+        let is_valid_range =
+            move |r: &CachedValueLabelRange| r.label_location.len() == processed_labels_len;
+
+        if dbi_log_enabled!() {
+            dbi_log!("Built ranges:");
+            for range in self.ranges.iter().filter(|r| is_valid_range(*r)) {
+                dbi_log!(
+                    "{:?}",
+                    BuiltRangeSummary {
+                        range,
+                        isa: self.isa
+                    }
+                );
+            }
+            dbi_log!("");
+        }
+
+        BuiltValueLabelRanges {
+            ranges: self.ranges.into_iter().filter(is_valid_range),
+            covers_entire_scope: self.covers_entire_scope,
+        }
     }
 }
 
@@ -796,13 +889,16 @@ impl std::fmt::Debug for JumpTargetMarker {
 }
 
 #[cfg(test)]
+#[expect(trivial_numeric_casts, reason = "macro-generated code")]
 mod tests {
     use super::{
         compile_expression, AddressTransform, CompiledExpression, CompiledExpressionPart,
         FunctionFrameInfo, JumpTargetMarker, ValueLabel, ValueLabelsRanges,
     };
     use crate::CompiledFunctionMetadata;
+    use cranelift_codegen::{isa::lookup, settings::Flags};
     use gimli::{constants, Encoding, EndianSlice, Expression, RunTimeEndian};
+    use target_lexicon::triple;
     use wasmtime_environ::FilePos;
 
     macro_rules! dw_op {
@@ -1223,6 +1319,16 @@ mod tests {
         use super::ValueLabelRangesBuilder;
         use crate::debug::ModuleMemoryOffset;
 
+        // Ignore this test if cranelift doesn't support the native platform.
+        if cranelift_native::builder().is_err() {
+            return;
+        }
+
+        let isa = lookup(triple!("x86_64"))
+            .expect("expect x86_64 ISA")
+            .finish(Flags::new(cranelift_codegen::settings::builder()))
+            .expect("Creating ISA");
+
         let addr_tr = create_mock_address_transform();
         let (value_ranges, value_labels) = create_mock_value_ranges();
         let fi = FunctionFrameInfo {
@@ -1231,29 +1337,31 @@ mod tests {
         };
 
         // No value labels, testing if entire function range coming through.
-        let builder = ValueLabelRangesBuilder::new(&[(10, 20)], &addr_tr, Some(&fi));
-        let ranges = builder.into_ranges().collect::<Vec<_>>();
+        let builder = ValueLabelRangesBuilder::new(&[(10, 20)], &addr_tr, Some(&fi), isa.as_ref());
+        let ranges = builder.into_ranges().ranges.collect::<Vec<_>>();
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].func_index, 0);
         assert_eq!(ranges[0].start, 0);
         assert_eq!(ranges[0].end, 30);
 
         // Two labels (val0@0..25 and val1@5..30), their common lifetime intersect at 5..25.
-        let mut builder = ValueLabelRangesBuilder::new(&[(10, 20)], &addr_tr, Some(&fi));
+        let mut builder =
+            ValueLabelRangesBuilder::new(&[(10, 20)], &addr_tr, Some(&fi), isa.as_ref());
         builder.process_label(value_labels.0);
         builder.process_label(value_labels.1);
-        let ranges = builder.into_ranges().collect::<Vec<_>>();
+        let ranges = builder.into_ranges().ranges.collect::<Vec<_>>();
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].start, 5);
         assert_eq!(ranges[0].end, 25);
 
         // Adds val2 with complex lifetime @0..10 and @20..30 to the previous test, and
         // also narrows range.
-        let mut builder = ValueLabelRangesBuilder::new(&[(11, 17)], &addr_tr, Some(&fi));
+        let mut builder =
+            ValueLabelRangesBuilder::new(&[(11, 17)], &addr_tr, Some(&fi), isa.as_ref());
         builder.process_label(value_labels.0);
         builder.process_label(value_labels.1);
         builder.process_label(value_labels.2);
-        let ranges = builder.into_ranges().collect::<Vec<_>>();
+        let ranges = builder.into_ranges().ranges.collect::<Vec<_>>();
         // Result is two ranges @5..10 and @20..23
         assert_eq!(ranges.len(), 2);
         assert_eq!(ranges[0].start, 5);

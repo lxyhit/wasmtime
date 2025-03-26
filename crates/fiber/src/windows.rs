@@ -1,4 +1,5 @@
 use crate::{RunResult, RuntimeFiberStack};
+use alloc::boxed::Box;
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::io;
@@ -7,11 +8,16 @@ use std::ptr;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Threading::*;
 
+pub type Error = io::Error;
+
 #[derive(Debug)]
 pub struct FiberStack(usize);
 
 impl FiberStack {
-    pub fn new(size: usize) -> io::Result<Self> {
+    pub fn new(size: usize, zeroed: bool) -> io::Result<Self> {
+        // We don't support fiber stack zeroing on windows.
+        let _ = zeroed;
+
         Ok(Self(size))
     }
 
@@ -61,7 +67,7 @@ struct StartState {
 
 const FIBER_FLAG_FLOAT_SWITCH: u32 = 1;
 
-extern "C" {
+unsafe extern "C" {
     #[wasmtime_versioned_export_macros::versioned_link]
     fn wasmtime_fiber_get_current() -> *mut c_void;
 }

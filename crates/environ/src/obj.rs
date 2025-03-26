@@ -1,6 +1,8 @@
 //! Utilities for working with object files that operate as Wasmtime's
 //! serialization and intermediate format for compiled modules.
 
+use core::fmt;
+
 /// Filler for the `os_abi` field of the ELF header.
 ///
 /// This is just a constant that seems reasonable in the sense it's unlikely to
@@ -14,6 +16,20 @@ pub const EF_WASMTIME_MODULE: u32 = 1 << 0;
 /// Flag for the `e_flags` field in the ELF header indicating a compiled
 /// component.
 pub const EF_WASMTIME_COMPONENT: u32 = 1 << 1;
+
+/// Flag for the `e_flags` field in the ELF header indicating compiled code for
+/// pulley32
+pub const EF_WASMTIME_PULLEY32: u32 = 1 << 2;
+
+/// Flag for the `e_flags` field in the ELF header indicating compiled code for
+/// pulley64
+pub const EF_WASMTIME_PULLEY64: u32 = 1 << 3;
+
+/// Flag for the `sh_flags` field in the ELF text section that indicates that
+/// the text section does not itself need to be executable. This is used for the
+/// Pulley target, for example, to indicate that it does not need to be made
+/// natively executable as it does not contain actual native code.
+pub const SH_WASMTIME_NOT_EXECUTED: u64 = 1 << 0;
 
 /// A custom Wasmtime-specific section of our compilation image which stores
 /// mapping data from offsets in the image to offset in the original wasm
@@ -43,6 +59,17 @@ pub const EF_WASMTIME_COMPONENT: u32 = 1 << 1;
 /// are unaligned. Additionally at this time the 32-bit encodings chosen here
 /// mean that >=4gb text sections are not supported.
 pub const ELF_WASMTIME_ADDRMAP: &str = ".wasmtime.addrmap";
+
+/// A custom Wasmtime-specific section of compilation which store information
+/// about live gc references at various locations in the text section (stack
+/// maps).
+///
+/// This section has a custom binary encoding described in `stack_maps.rs` which
+/// is used to implement the single query we want to satisy of: where are the
+/// live GC references at this pc? Like the addrmap section this has an
+/// alignment of 1 with unaligned reads, and it additionally doesn't support
+/// >=4gb text sections.
+pub const ELF_WASMTIME_STACK_MAP: &str = ".wasmtime.stackmap";
 
 /// A custom binary-encoded section of wasmtime compilation artifacts which
 /// encodes the ability to map an offset in the text section to the trap code
@@ -132,7 +159,7 @@ pub const ELF_WASMTIME_DWARF: &str = ".wasmtime.dwarf";
 macro_rules! libcalls {
     ($($rust:ident = $sym:tt)*) => (
         #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
-        #[allow(missing_docs)]
+        #[expect(missing_docs, reason = "self-describing variants")]
         pub enum LibCall {
             $($rust,)*
         }
@@ -171,3 +198,21 @@ libcalls! {
     FmaF64 = "libcall_fmaf64"
     X86Pshufb = "libcall_x86_pshufb"
 }
+
+/// Workaround to implement `core::error::Error` until
+/// gimli-rs/object#747 is settled.
+pub struct ObjectCrateErrorWrapper(pub object::Error);
+
+impl fmt::Debug for ObjectCrateErrorWrapper {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Display for ObjectCrateErrorWrapper {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl core::error::Error for ObjectCrateErrorWrapper {}

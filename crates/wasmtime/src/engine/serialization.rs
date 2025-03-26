@@ -24,10 +24,10 @@
 use crate::prelude::*;
 use crate::{Engine, ModuleVersionStrategy, Precompiled};
 use core::str::FromStr;
-use object::endian::NativeEndian;
+use object::endian::Endianness;
 #[cfg(any(feature = "cranelift", feature = "winch"))]
 use object::write::{Object, StandardSegment};
-use object::{read::elf::ElfFile64, FileFlags, Object as _, ObjectSection, SectionKind};
+use object::{read::elf::ElfFile64, FileFlags, Object as _, ObjectSection};
 use serde_derive::{Deserialize, Serialize};
 use wasmtime_environ::obj;
 use wasmtime_environ::{FlagValue, ObjectKind, Tunables};
@@ -56,8 +56,8 @@ pub fn check_compatible(engine: &Engine, mmap: &[u8], expected: ObjectKind) -> R
     // structured well enough to make this easy and additionally it's not really
     // a perf issue right now so doing that is left for another day's
     // refactoring.
-    let obj = ElfFile64::<NativeEndian>::parse(mmap)
-        .err2anyhow()
+    let obj = ElfFile64::<Endianness>::parse(mmap)
+        .map_err(obj::ObjectCrateErrorWrapper)
         .context("failed to parse precompiled artifact as an ELF")?;
     let expected_e_flags = match expected {
         ObjectKind::Module => obj::EF_WASMTIME_MODULE,
@@ -68,7 +68,7 @@ pub fn check_compatible(engine: &Engine, mmap: &[u8], expected: ObjectKind) -> R
             os_abi: obj::ELFOSABI_WASMTIME,
             abi_version: 0,
             e_flags,
-        } if e_flags == expected_e_flags => {}
+        } if e_flags & expected_e_flags == expected_e_flags => {}
         _ => bail!("incompatible object file format"),
     }
 
@@ -76,7 +76,7 @@ pub fn check_compatible(engine: &Engine, mmap: &[u8], expected: ObjectKind) -> R
         .section_by_name(obj::ELF_WASM_ENGINE)
         .ok_or_else(|| anyhow!("failed to find section `{}`", obj::ELF_WASM_ENGINE))?
         .data()
-        .err2anyhow()?;
+        .map_err(obj::ObjectCrateErrorWrapper)?;
     let (first, data) = data
         .split_first()
         .ok_or_else(|| anyhow!("invalid engine section"))?;
@@ -95,7 +95,7 @@ pub fn check_compatible(engine: &Engine, mmap: &[u8], expected: ObjectKind) -> R
 
     match &engine.config().module_version {
         ModuleVersionStrategy::WasmtimeVersion => {
-            let version = core::str::from_utf8(version).err2anyhow()?;
+            let version = core::str::from_utf8(version)?;
             if version != env!("CARGO_PKG_VERSION") {
                 bail!(
                     "Module was compiled with incompatible Wasmtime version '{}'",
@@ -104,7 +104,7 @@ pub fn check_compatible(engine: &Engine, mmap: &[u8], expected: ObjectKind) -> R
             }
         }
         ModuleVersionStrategy::Custom(v) => {
-            let version = core::str::from_utf8(&version).err2anyhow()?;
+            let version = core::str::from_utf8(&version)?;
             if version != v {
                 bail!(
                     "Module was compiled with incompatible version '{}'",
@@ -114,9 +114,7 @@ pub fn check_compatible(engine: &Engine, mmap: &[u8], expected: ObjectKind) -> R
         }
         ModuleVersionStrategy::None => { /* ignore the version info, accept all */ }
     }
-    postcard::from_bytes::<Metadata<'_>>(data)
-        .err2anyhow()?
-        .check_compatible(engine)
+    postcard::from_bytes::<Metadata<'_>>(data)?.check_compatible(engine)
 }
 
 #[cfg(any(feature = "cranelift", feature = "winch"))]
@@ -124,7 +122,7 @@ pub fn append_compiler_info(engine: &Engine, obj: &mut Object<'_>, metadata: &Me
     let section = obj.add_section(
         obj.segment_name(StandardSegment::Data).to_vec(),
         obj::ELF_WASM_ENGINE.as_bytes().to_vec(),
-        SectionKind::ReadOnlyData,
+        object::SectionKind::ReadOnlyData,
     );
     let mut data = Vec::new();
     data.push(VERSION);
@@ -145,19 +143,19 @@ pub fn append_compiler_info(engine: &Engine, obj: &mut Object<'_>, metadata: &Me
 }
 
 fn detect_precompiled<'data, R: object::ReadRef<'data>>(
-    obj: ElfFile64<'data, NativeEndian, R>,
+    obj: ElfFile64<'data, Endianness, R>,
 ) -> Option<Precompiled> {
     match obj.flags() {
         FileFlags::Elf {
             os_abi: obj::ELFOSABI_WASMTIME,
             abi_version: 0,
-            e_flags: obj::EF_WASMTIME_MODULE,
-        } => Some(Precompiled::Module),
+            e_flags,
+        } if e_flags & obj::EF_WASMTIME_MODULE != 0 => Some(Precompiled::Module),
         FileFlags::Elf {
             os_abi: obj::ELFOSABI_WASMTIME,
             abi_version: 0,
-            e_flags: obj::EF_WASMTIME_COMPONENT,
-        } => Some(Precompiled::Component),
+            e_flags,
+        } if e_flags & obj::EF_WASMTIME_COMPONENT != 0 => Some(Precompiled::Component),
         _ => None,
     }
 }
@@ -202,10 +200,10 @@ struct WasmFeatures {
     function_references: bool,
     gc: bool,
     custom_page_sizes: bool,
-    component_model_more_flags: bool,
-    component_model_multiple_returns: bool,
+    component_model_async: bool,
     gc_types: bool,
     wide_arithmetic: bool,
+    stack_switching: bool,
 }
 
 impl Metadata<'_> {
@@ -231,8 +229,7 @@ impl Metadata<'_> {
             shared_everything_threads,
             component_model_values,
             component_model_nested_names,
-            component_model_more_flags,
-            component_model_multiple_returns,
+            component_model_async,
             legacy_exceptions,
             gc_types,
             stack_switching,
@@ -253,7 +250,6 @@ impl Metadata<'_> {
         assert!(!component_model_nested_names);
         assert!(!shared_everything_threads);
         assert!(!legacy_exceptions);
-        assert!(!stack_switching);
 
         Metadata {
             target: engine.compiler().triple().to_string(),
@@ -276,10 +272,10 @@ impl Metadata<'_> {
                 function_references,
                 gc,
                 custom_page_sizes,
-                component_model_more_flags,
-                component_model_multiple_returns,
+                component_model_async,
                 gc_types,
                 wide_arithmetic,
+                stack_switching,
             },
         }
     }
@@ -376,6 +372,7 @@ impl Metadata<'_> {
             relaxed_simd_deterministic,
             winch_callable,
             signals_based_traps,
+            memory_init_cow,
             // This doesn't affect compilation, it's just a runtime setting.
             memory_reservation_for_growth: _,
 
@@ -438,6 +435,11 @@ impl Metadata<'_> {
             other.signals_based_traps,
             "Signals-based traps",
         )?;
+        Self::check_bool(
+            memory_init_cow,
+            other.memory_init_cow,
+            "memory initialization with CoW",
+        )?;
 
         Ok(())
     }
@@ -480,10 +482,10 @@ impl Metadata<'_> {
             function_references,
             gc,
             custom_page_sizes,
-            component_model_more_flags,
-            component_model_multiple_returns,
+            component_model_async,
             gc_types,
             wide_arithmetic,
+            stack_switching,
         } = self.features;
 
         use wasmparser::WasmFeatures as F;
@@ -559,14 +561,9 @@ impl Metadata<'_> {
             "WebAssembly custom-page-sizes support",
         )?;
         Self::check_bool(
-            component_model_more_flags,
-            other.contains(F::COMPONENT_MODEL_MORE_FLAGS),
-            "WebAssembly component model support for more than 32 flags",
-        )?;
-        Self::check_bool(
-            component_model_multiple_returns,
-            other.contains(F::COMPONENT_MODEL_MULTIPLE_RETURNS),
-            "WebAssembly component model support for multiple returns",
+            component_model_async,
+            other.contains(F::COMPONENT_MODEL_ASYNC),
+            "WebAssembly component model support for async lifts/lowers, futures, streams, and errors",
         )?;
         Self::check_cfg_bool(
             cfg!(feature = "gc"),
@@ -580,7 +577,11 @@ impl Metadata<'_> {
             other.contains(F::WIDE_ARITHMETIC),
             "WebAssembly wide-arithmetic support",
         )?;
-
+        Self::check_bool(
+            stack_switching,
+            other.contains(F::STACK_SWITCHING),
+            "WebAssembly stack switching support",
+        )?;
         Ok(())
     }
 
@@ -637,6 +638,8 @@ mod test {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")] // test on a platform that is known to use
+                                   // Cranelift
     fn test_os_mismatch() -> Result<()> {
         let engine = Engine::default();
         let mut metadata = Metadata::new(&engine);
@@ -708,6 +711,7 @@ Caused by:
 
     #[test]
     #[cfg_attr(miri, ignore)]
+    #[cfg(target_pointer_width = "64")] // different defaults on 32-bit platforms
     fn test_tunables_int_mismatch() -> Result<()> {
         let engine = Engine::default();
         let mut metadata = Metadata::new(&engine);
@@ -716,7 +720,7 @@ Caused by:
 
         match metadata.check_compatible(&engine) {
             Ok(_) => unreachable!(),
-            Err(e) => assert_eq!(e.to_string(), "Module was compiled with a memory guard size of '0' but '2147483648' is expected for the host"),
+            Err(e) => assert_eq!(e.to_string(), "Module was compiled with a memory guard size of '0' but '33554432' is expected for the host"),
         }
 
         Ok(())
@@ -758,6 +762,8 @@ Caused by:
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")] // test on a platform that is known to
+                                   // implement threads
     fn test_feature_mismatch() -> Result<()> {
         let mut config = Config::new();
         config.wasm_threads(true);

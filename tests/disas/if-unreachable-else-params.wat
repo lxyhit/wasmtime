@@ -45,27 +45,27 @@
 ;; function u0:0(i64 vmctx, i64, i32) tail {
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly gv0+8
-;;     gv2 = load.i64 notrap aligned gv1
+;;     gv2 = load.i64 notrap aligned gv1+16
 ;;     gv3 = vmctx
-;;     gv4 = load.i64 notrap aligned gv3+120
-;;     gv5 = load.i64 notrap aligned readonly checked gv3+112
+;;     gv4 = load.i64 notrap aligned gv3+88
+;;     gv5 = load.i64 notrap aligned readonly can_move checked gv3+80
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64, v2: i32):
 ;; @0043                               v3 = iconst.i32 35
-;; @0045                               jump block2(v3)  ; v3 = 35
+;; @0045                               jump block2
 ;;
-;;                                 block2(v4: i32):
-;; @0049                               brif.i32 v2, block4, block6(v4)
+;;                                 block2:
+;; @0049                               brif.i32 v2, block4, block6
 ;;
 ;;                                 block4:
-;; @004b                               v7 = uextend.i64 v4
-;; @004b                               v8 = global_value.i64 gv5
+;; @004b                               v7 = uextend.i64 v3  ; v3 = 35
+;; @004b                               v8 = load.i64 notrap aligned readonly can_move checked v0+80
 ;; @004b                               v9 = iadd v8, v7
 ;; @004b                               v10 = sload16.i64 little heap v9
 ;; @004e                               trap user11
 ;;
-;;                                 block6(v6: i32):
-;; @005d                               v11 = popcnt.i32 v4
+;;                                 block6:
+;; @005d                               v11 = popcnt.i32 v3  ; v3 = 35
 ;; @0060                               return
 ;; }

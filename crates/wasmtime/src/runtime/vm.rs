@@ -9,18 +9,19 @@ use crate::prelude::*;
 use crate::store::StoreOpaque;
 use alloc::sync::Arc;
 use core::fmt;
-use core::mem;
 use core::ops::Deref;
 use core::ops::DerefMut;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use wasmtime_environ::{
-    DefinedFuncIndex, DefinedMemoryIndex, HostPtr, ModuleInternedTypeIndex, VMOffsets,
-    VMSharedTypeIndex,
+    DefinedFuncIndex, DefinedMemoryIndex, HostPtr, VMOffsets, VMSharedTypeIndex,
 };
 
+#[cfg(feature = "gc")]
+use wasmtime_environ::ModuleInternedTypeIndex;
+
+#[cfg(has_host_compiler_backend)]
 mod arch;
-mod async_yield;
 #[cfg(feature = "component-model")]
 pub mod component;
 mod const_expr;
@@ -29,29 +30,39 @@ mod gc;
 mod imports;
 mod instance;
 mod memory;
-mod mmap;
 mod mmap_vec;
+mod provenance;
 mod send_sync_ptr;
-mod send_sync_unsafe_cell;
 mod store_box;
 mod sys;
 mod table;
 mod traphandlers;
+mod unwind;
 mod vmcontext;
 
-mod threads;
-pub use self::threads::*;
+#[cfg(feature = "threads")]
+mod parking_spot;
 
-#[cfg(feature = "debug-builtins")]
+// Note that `debug_builtins` here is disabled with a feature or a lack of a
+// native compilation backend because it's only here to assist in debugging
+// natively compiled code.
+#[cfg(all(has_host_compiler_backend, feature = "debug-builtins"))]
 pub mod debug_builtins;
 pub mod libcalls;
 pub mod mpk;
 
+#[cfg(feature = "pulley")]
+pub(crate) mod interpreter;
+#[cfg(not(feature = "pulley"))]
+pub(crate) mod interpreter_disabled;
+#[cfg(not(feature = "pulley"))]
+pub(crate) use interpreter_disabled as interpreter;
+
 #[cfg(feature = "debug-builtins")]
 pub use wasmtime_jit_debug::gdb_jit_int::GdbJitImageRegistration;
 
+#[cfg(has_host_compiler_backend)]
 pub use crate::runtime::vm::arch::get_stack_pointer;
-pub use crate::runtime::vm::async_yield::*;
 pub use crate::runtime::vm::export::*;
 pub use crate::runtime::vm::gc::*;
 pub use crate::runtime::vm::imports::Imports;
@@ -65,27 +76,58 @@ pub use crate::runtime::vm::instance::{
     InstanceLimits, PoolConcurrencyLimitError, PoolingInstanceAllocator,
     PoolingInstanceAllocatorConfig,
 };
-pub use crate::runtime::vm::memory::{Memory, RuntimeLinearMemory, RuntimeMemoryCreator};
-pub use crate::runtime::vm::mmap::Mmap;
+pub use crate::runtime::vm::interpreter::*;
+pub use crate::runtime::vm::memory::{
+    Memory, MemoryBase, RuntimeLinearMemory, RuntimeMemoryCreator, SharedMemory,
+};
 pub use crate::runtime::vm::mmap_vec::MmapVec;
-pub use crate::runtime::vm::mpk::MpkEnabled;
+pub use crate::runtime::vm::provenance::*;
 pub use crate::runtime::vm::store_box::*;
+#[cfg(feature = "std")]
+pub use crate::runtime::vm::sys::mmap::open_file_for_mmap;
+#[cfg(has_host_compiler_backend)]
 pub use crate::runtime::vm::sys::unwind::UnwindRegistration;
 pub use crate::runtime::vm::table::{Table, TableElement};
 pub use crate::runtime::vm::traphandlers::*;
+pub use crate::runtime::vm::unwind::*;
 pub use crate::runtime::vm::vmcontext::{
     VMArrayCallFunction, VMArrayCallHostFuncContext, VMContext, VMFuncRef, VMFunctionBody,
     VMFunctionImport, VMGlobalDefinition, VMGlobalImport, VMMemoryDefinition, VMMemoryImport,
-    VMOpaqueContext, VMRuntimeLimits, VMTableImport, VMWasmCallFunction, ValRaw,
+    VMOpaqueContext, VMStoreContext, VMTableImport, VMTagImport, VMWasmCallFunction, ValRaw,
 };
 pub use send_sync_ptr::SendSyncPtr;
-pub use send_sync_unsafe_cell::SendSyncUnsafeCell;
 
 mod module_id;
 pub use module_id::CompiledModuleId;
 
+#[cfg(has_virtual_memory)]
+mod byte_count;
+#[cfg(has_virtual_memory)]
 mod cow;
-pub use crate::runtime::vm::cow::{MemoryImage, MemoryImageSlot, ModuleMemoryImages};
+#[cfg(not(has_virtual_memory))]
+mod cow_disabled;
+#[cfg(has_virtual_memory)]
+mod mmap;
+
+#[cfg(feature = "async")]
+mod async_yield;
+#[cfg(feature = "async")]
+pub use crate::runtime::vm::async_yield::*;
+
+#[cfg(feature = "gc-null")]
+mod send_sync_unsafe_cell;
+#[cfg(feature = "gc-null")]
+pub use send_sync_unsafe_cell::SendSyncUnsafeCell;
+
+cfg_if::cfg_if! {
+    if #[cfg(has_virtual_memory)] {
+        pub use crate::runtime::vm::byte_count::*;
+        pub use crate::runtime::vm::mmap::{Mmap, MmapOffset};
+        pub use self::cow::{MemoryImage, MemoryImageSlot, ModuleMemoryImages};
+    } else {
+        pub use self::cow_disabled::{MemoryImage, MemoryImageSlot, ModuleMemoryImages};
+    }
+}
 
 /// Dynamic runtime functionality needed by this crate throughout the execution
 /// of a wasm instance.
@@ -144,6 +186,7 @@ pub unsafe trait VMStore {
     /// Callback invoked whenever an instance observes a new epoch
     /// number. Cannot fail; cooperative epoch-based yielding is
     /// completely semantically transparent. Returns the new deadline.
+    #[cfg(target_has_atomic = "64")]
     fn new_epoch(&mut self) -> Result<u64, Error>;
 
     /// Callback invoked whenever an instance needs to trigger a GC.
@@ -160,6 +203,11 @@ pub unsafe trait VMStore {
     /// Metadata required for resources for the component model.
     #[cfg(feature = "component-model")]
     fn component_calls(&mut self) -> &mut component::CallContexts;
+
+    #[cfg(feature = "component-model-async")]
+    fn component_async_store(
+        &mut self,
+    ) -> &mut dyn crate::runtime::component::VMComponentAsyncStore;
 }
 
 impl Deref for dyn VMStore + '_ {
@@ -175,6 +223,29 @@ impl DerefMut for dyn VMStore + '_ {
         self.store_opaque_mut()
     }
 }
+
+/// A newtype wrapper around `NonNull<dyn VMStore>` intended to be a
+/// self-pointer back to the `Store<T>` within raw data structures like
+/// `VMContext`.
+///
+/// This type exists to manually, and unsafely, implement `Send` and `Sync`.
+/// The `VMStore` trait doesn't require `Send` or `Sync` which means this isn't
+/// naturally either trait (e.g. with `SendSyncPtr` instead). Note that this
+/// means that `Instance` is, for example, mistakenly considered
+/// unconditionally `Send` and `Sync`. This is hopefully ok for now though
+/// because from a user perspective the only type that matters is `Store<T>`.
+/// That type is `Send + Sync` if `T: Send + Sync` already so the internal
+/// storage of `Instance` shouldn't matter as the final result is the same.
+/// Note though that this means we need to be extra vigilant about cross-thread
+/// usage of `Instance` and `ComponentInstance` for example.
+#[derive(Copy, Clone)]
+#[repr(transparent)]
+struct VMStoreRawPtr(pub NonNull<dyn VMStore>);
+
+// SAFETY: this is the purpose of `VMStoreRawPtr`, see docs above about safe
+// usage.
+unsafe impl Send for VMStoreRawPtr {}
+unsafe impl Sync for VMStoreRawPtr {}
 
 /// Functionality required by this crate for a particular module. This
 /// is chiefly needed for lazy initialization of various bits of
@@ -232,6 +303,7 @@ impl ModuleRuntimeInfo {
 
     /// Translate a module-level interned type index into an engine-level
     /// interned type index.
+    #[cfg(feature = "gc")]
     fn engine_type_index(&self, module_index: ModuleInternedTypeIndex) -> VMSharedTypeIndex {
         match self {
             ModuleRuntimeInfo::Module(m) => m
@@ -263,16 +335,16 @@ impl ModuleRuntimeInfo {
     ///
     /// Returns `None` for Wasm functions which do not escape, and therefore are
     /// not callable from outside the Wasm module itself.
-    fn array_to_wasm_trampoline(&self, index: DefinedFuncIndex) -> Option<VMArrayCallFunction> {
+    fn array_to_wasm_trampoline(
+        &self,
+        index: DefinedFuncIndex,
+    ) -> Option<NonNull<VMArrayCallFunction>> {
         let m = match self {
             ModuleRuntimeInfo::Module(m) => m,
             ModuleRuntimeInfo::Bare(_) => unreachable!(),
         };
-        let ptr = m
-            .compiled_module()
-            .array_to_wasm_trampoline(index)?
-            .as_ptr();
-        Some(unsafe { mem::transmute::<*const u8, VMArrayCallFunction>(ptr) })
+        let ptr = NonNull::from(m.compiled_module().array_to_wasm_trampoline(index)?);
+        Some(ptr.cast())
     }
 
     /// Returns the `MemoryImage` structure used for copy-on-write
@@ -293,6 +365,7 @@ impl ModuleRuntimeInfo {
     /// A unique ID for this particular module. This can be used to
     /// allow for fastpaths to optimize a "re-instantiate the same
     /// module again" case.
+    #[cfg(feature = "pooling-allocator")]
     fn unique_id(&self) -> Option<CompiledModuleId> {
         match self {
             ModuleRuntimeInfo::Module(m) => Some(m.id()),
@@ -335,6 +408,7 @@ impl ModuleRuntimeInfo {
 }
 
 /// Returns the host OS page size, in bytes.
+#[cfg(has_virtual_memory)]
 pub fn host_page_size() -> usize {
     static PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
 
@@ -347,32 +421,6 @@ pub fn host_page_size() -> usize {
         }
         n => n,
     };
-}
-
-/// Is `bytes` a multiple of the host page size?
-pub fn usize_is_multiple_of_host_page_size(bytes: usize) -> bool {
-    bytes % host_page_size() == 0
-}
-
-/// Round the given byte size up to a multiple of the host OS page size.
-///
-/// Returns an error if rounding up overflows.
-pub fn round_u64_up_to_host_pages(bytes: u64) -> Result<u64> {
-    let page_size = u64::try_from(crate::runtime::vm::host_page_size()).err2anyhow()?;
-    debug_assert!(page_size.is_power_of_two());
-    bytes
-        .checked_add(page_size - 1)
-        .ok_or_else(|| anyhow!(
-            "{bytes} is too large to be rounded up to a multiple of the host page size of {page_size}"
-        ))
-        .map(|val| val & !(page_size - 1))
-}
-
-/// Same as `round_u64_up_to_host_pages` but for `usize`s.
-pub fn round_usize_up_to_host_pages(bytes: usize) -> Result<usize> {
-    let bytes = u64::try_from(bytes).err2anyhow()?;
-    let rounded = round_u64_up_to_host_pages(bytes)?;
-    Ok(usize::try_from(rounded).err2anyhow()?)
 }
 
 /// Result of `Memory::atomic_wait32` and `Memory::atomic_wait64`

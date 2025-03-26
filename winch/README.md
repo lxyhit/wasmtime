@@ -25,7 +25,7 @@ Winch's primary goal is compilation performance, therefore only certain, very
 limited peephole optimations are applied.
 
 For more details on the original motivation and goals, refer to the [Bytecode
-Alliance RFC for Baseline Compilation in Wasmtime.](rfc).
+Alliance RFC for Baseline Compilation in Wasmtime.][rfc].
 
 [rfc]: https://github.com/bytecodealliance/rfcs/blob/main/accepted/wasmtime-baseline-compilation.md
 
@@ -54,7 +54,7 @@ Alliance RFC for Baseline Compilation in Wasmtime.](rfc).
 
 Winch's aim is to support all the backends officially supported by Wasmtime:
 
-* x64\_64
+* x86\_64
 * arm64
 * riscv64
 * s390x

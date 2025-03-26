@@ -20,7 +20,7 @@
 
 ;; wasm[0]::function[0]:
 ;;       lg      %r1, 8(%r2)
-;;       lg      %r1, 0(%r1)
+;;       lg      %r1, 0x10(%r1)
 ;;       la      %r1, 0xa0(%r1)
 ;;       clgrtle %r15, %r1
 ;;       stmg    %r14, %r15, 0x70(%r15)
@@ -30,7 +30,7 @@
 ;;       llgfr   %r7, %r4
 ;;       clgfi   %r7, 0xfffc
 ;;       jgh     0x34
-;;       ag      %r7, 0x60(%r2)
+;;       ag      %r7, 0x50(%r2)
 ;;       llilh   %r4, 0xffff
 ;;       strv    %r5, 0(%r4, %r7)
 ;;       lmg     %r14, %r15, 0x110(%r15)
@@ -38,7 +38,7 @@
 ;;
 ;; wasm[0]::function[1]:
 ;;       lg      %r1, 8(%r2)
-;;       lg      %r1, 0(%r1)
+;;       lg      %r1, 0x10(%r1)
 ;;       la      %r1, 0xa0(%r1)
 ;;       clgrtle %r15, %r1
 ;;       stmg    %r14, %r15, 0x70(%r15)
@@ -48,7 +48,7 @@
 ;;       llgfr   %r7, %r4
 ;;       clgfi   %r7, 0xfffc
 ;;       jgh     0x84
-;;       ag      %r7, 0x60(%r2)
+;;       ag      %r7, 0x50(%r2)
 ;;       llilh   %r4, 0xffff
 ;;       lrv     %r2, 0(%r4, %r7)
 ;;       lmg     %r14, %r15, 0x110(%r15)

@@ -26,13 +26,15 @@ impl WasmtimeEngine {
     ) -> arbitrary::Result<Self> {
         let mut new_config = u.arbitrary::<WasmtimeConfig>()?;
         new_config.compiler_strategy = compiler_strategy;
-        new_config.update_module_config(&mut config.module_config.config, u)?;
+        new_config.update_module_config(&mut config.module_config, u)?;
         new_config.make_compatible_with(&config.wasmtime);
 
         let config = generators::Config {
             wasmtime: new_config,
             module_config: config.module_config.clone(),
         };
+        log::debug!("Created new Wasmtime differential engine with config: {config:?}");
+
         Ok(Self { config })
     }
 }
@@ -40,8 +42,9 @@ impl WasmtimeEngine {
 impl DiffEngine for WasmtimeEngine {
     fn name(&self) -> &'static str {
         match self.config.wasmtime.compiler_strategy {
-            CompilerStrategy::Cranelift => "wasmtime",
+            CompilerStrategy::CraneliftNative => "wasmtime",
             CompilerStrategy::Winch => "winch",
+            CompilerStrategy::CraneliftPulley => "pulley",
         }
     }
 
@@ -52,16 +55,17 @@ impl DiffEngine for WasmtimeEngine {
         Ok(Box::new(instance))
     }
 
-    fn assert_error_match(&self, trap: &Trap, err: &Error) {
-        let trap2 = err
+    fn assert_error_match(&self, lhs: &Error, rhs: &Trap) {
+        let lhs = lhs
             .downcast_ref::<Trap>()
-            .expect(&format!("not a trap: {err:?}"));
-        assert_eq!(trap, trap2, "{trap}\nis not equal to\n{trap2}");
+            .expect(&format!("not a trap: {lhs:?}"));
+
+        assert_eq!(lhs, rhs, "{lhs}\nis not equal to\n{rhs}");
     }
 
-    fn is_stack_overflow(&self, err: &Error) -> bool {
+    fn is_non_deterministic_error(&self, err: &Error) -> bool {
         match err.downcast_ref::<Trap>() {
-            Some(trap) => *trap == Trap::StackOverflow,
+            Some(trap) => super::wasmtime_trap_is_non_deterministic(trap),
             None => false,
         }
     }
@@ -117,11 +121,10 @@ impl WasmtimeInstance {
 
         globals
             .into_iter()
-            .map(|(name, global)| {
-                (
-                    name,
-                    global.ty(&self.store).content().clone().try_into().unwrap(),
-                )
+            .filter_map(|(name, global)| {
+                DiffValueType::try_from(global.ty(&self.store).content().clone())
+                    .map(|ty| (name, ty))
+                    .ok()
             })
             .collect()
     }
@@ -244,9 +247,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn smoke_cranelift() {
+    fn smoke_cranelift_native() {
         crate::oracles::engine::smoke_test_engine(|u, config| {
-            WasmtimeEngine::new(u, config, CompilerStrategy::Cranelift)
+            WasmtimeEngine::new(u, config, CompilerStrategy::CraneliftNative)
+        })
+    }
+
+    #[test]
+    fn smoke_cranelift_pulley() {
+        crate::oracles::engine::smoke_test_engine(|u, config| {
+            WasmtimeEngine::new(u, config, CompilerStrategy::CraneliftPulley)
         })
     }
 

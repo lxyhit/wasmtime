@@ -9,7 +9,11 @@ use inst::InstAndKind;
 use crate::ir::{condcodes::*, immediates::*, types::*, *};
 use crate::isa::pulley_shared::{
     abi::*,
-    inst::{FReg, OperandSize, VReg, WritableFReg, WritableVReg, WritableXReg, XReg},
+    inst::{
+        FReg, OperandSize, PulleyCall, ReturnCallInfo, VReg, WritableFReg, WritableVReg,
+        WritableXReg, XReg,
+    },
+    lower::{regs, Cond},
     *,
 };
 use crate::machinst::{
@@ -18,13 +22,24 @@ use crate::machinst::{
     CallInfo, IsTailCall, MachInst, Reg, VCodeConstant, VCodeConstantData,
 };
 use alloc::boxed::Box;
+use pulley_interpreter::U6;
 use regalloc2::PReg;
 type Unit = ();
 type VecArgPair = Vec<ArgPair>;
 type VecRetPair = Vec<RetPair>;
-type BoxCallInfo = Box<CallInfo<ExternalName>>;
+type BoxCallInfo = Box<CallInfo<PulleyCall>>;
 type BoxCallIndInfo = Box<CallInfo<XReg>>;
+type BoxCallIndirectHostInfo = Box<CallInfo<ExternalName>>;
+type BoxReturnCallInfo = Box<ReturnCallInfo<ExternalName>>;
+type BoxReturnCallIndInfo = Box<ReturnCallInfo<XReg>>;
 type BoxExternalName = Box<ExternalName>;
+type UpperXRegSet = pulley_interpreter::UpperRegSet<pulley_interpreter::XReg>;
+
+#[expect(
+    unused_imports,
+    reason = "used on other backends, used here to suppress warning elsewhere"
+)]
+use crate::machinst::isle::UnwindInst as _;
 
 pub(crate) struct PulleyIsleContext<'a, 'b, I, B>
 where
@@ -50,10 +65,6 @@ where
 {
     crate::isle_lower_prelude_methods!(InstAndKind<P>);
     crate::isle_prelude_caller_methods!(PulleyABICallSite<P>);
-
-    fn lower_br_table(&mut self, _index: Reg, _targets: &[MachLabel]) -> Unit {
-        todo!()
-    }
 
     fn vreg_new(&mut self, r: Reg) -> VReg {
         VReg::new(r).unwrap()
@@ -104,6 +115,54 @@ where
     #[inline]
     fn emit(&mut self, arg0: &MInst) -> Unit {
         self.lower_ctx.emit(arg0.clone().into());
+    }
+
+    fn sp_reg(&mut self) -> XReg {
+        XReg::new(regs::stack_reg()).unwrap()
+    }
+
+    fn cond_invert(&mut self, cond: &Cond) -> Cond {
+        cond.invert()
+    }
+
+    fn u6_from_u8(&mut self, imm: u8) -> Option<U6> {
+        U6::new(imm)
+    }
+
+    fn endianness(&mut self, flags: MemFlags) -> Endianness {
+        flags.endianness(self.backend.isa_flags.endianness())
+    }
+
+    fn is_native_endianness(&mut self, endianness: &Endianness) -> bool {
+        *endianness == self.backend.isa_flags.endianness()
+    }
+
+    fn pointer_width(&mut self) -> PointerWidth {
+        P::pointer_width()
+    }
+
+    fn memflags_nontrapping(&mut self, flags: MemFlags) -> bool {
+        flags.trap_code().is_none()
+    }
+
+    fn memflags_is_wasm(&mut self, flags: MemFlags) -> bool {
+        flags.trap_code() == Some(TrapCode::HEAP_OUT_OF_BOUNDS)
+            && self.endianness(flags) == Endianness::Little
+    }
+
+    fn g32_offset(
+        &mut self,
+        load_offset: i32,
+        load_ty: Type,
+        bound_check_offset: u64,
+    ) -> Option<u16> {
+        // NB: for more docs on this see the ISLE definition.
+        let load_offset = u64::try_from(load_offset).ok()?;
+        let load_bytes = u64::from(load_ty.bytes());
+        if bound_check_offset != load_offset + load_bytes {
+            return None;
+        }
+        u16::try_from(load_offset).ok()
     }
 }
 

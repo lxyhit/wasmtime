@@ -942,21 +942,6 @@
       (cond Cond)
       (trap_code TrapCode))
 
-    ;; A one-way conditional branch, invisible to the CFG processing; used *only* as part of
-    ;; straight-line sequences in code to be emitted.
-    ;;
-    ;; In more detail:
-    ;; - This branch is lowered to a branch at the machine-code level, but does not end a basic
-    ;;   block, and does not create edges in the CFG seen by regalloc.
-    ;; - Thus, it is *only* valid to use as part of a single-in, single-out sequence that is
-    ;;   lowered from a single CLIF instruction. For example, certain arithmetic operations may
-    ;;   use these branches to handle certain conditions, such as overflows, traps, etc.
-    ;;
-    ;; See, e.g., the lowering of `trapif` (conditional trap) for an example.
-    (OneWayCondBr
-      (target MachLabel)
-      (cond Cond))
-
     ;; An indirect branch through a register, augmented with set of all
     ;; possible successors.
     (IndirectBr
@@ -974,7 +959,14 @@
     ;; Jump-table sequence, as one compound instruction (see note in lower.rs
     ;; for rationale).
     (JTSequence
+      ;; The index into the list of targets.
       (ridx Reg)
+      ;; The default target.
+      (default MachLabel)
+      ;; The condition for taking the default target, based on flags
+      ;; when this instruction executes.
+      (default_cond Cond)
+      ;; All other targets.
       (targets BoxVecMachLabel))
 
     ;; Stack probe loop sequence, as one compound instruction.
@@ -1496,10 +1488,10 @@
 
 ;; Check whether two lane order values are equal.
 (decl pure lane_order_equal (LaneOrder LaneOrder) bool)
-(rule (lane_order_equal (LaneOrder.LittleEndian) (LaneOrder.LittleEndian)) $true)
-(rule (lane_order_equal (LaneOrder.LittleEndian) (LaneOrder.BigEndian)) $false)
-(rule (lane_order_equal (LaneOrder.BigEndian) (LaneOrder.LittleEndian)) $false)
-(rule (lane_order_equal (LaneOrder.BigEndian) (LaneOrder.BigEndian)) $true)
+(rule (lane_order_equal (LaneOrder.LittleEndian) (LaneOrder.LittleEndian)) true)
+(rule (lane_order_equal (LaneOrder.LittleEndian) (LaneOrder.BigEndian)) false)
+(rule (lane_order_equal (LaneOrder.BigEndian) (LaneOrder.LittleEndian)) false)
+(rule (lane_order_equal (LaneOrder.BigEndian) (LaneOrder.BigEndian)) true)
 
 ;; Return lane order matching memory byte order.
 (decl pure lane_order_from_memflags (MemFlags) LaneOrder)
@@ -2702,16 +2694,18 @@
 (rule (cond_br taken not_taken cond)
       (ConsumesFlags.ConsumesFlagsSideEffect (MInst.CondBr taken not_taken cond)))
 
-;; Helper for emitting `MInst.OneWayCondBr` instructions.
-(decl oneway_cond_br (MachLabel Cond) ConsumesFlags)
-(rule (oneway_cond_br dest cond)
-      (ConsumesFlags.ConsumesFlagsSideEffect (MInst.OneWayCondBr dest cond)))
-
 ;; Helper for emitting `MInst.JTSequence` instructions.
-(decl jt_sequence (Reg BoxVecMachLabel) SideEffectNoResult)
-(rule (jt_sequence ridx targets)
-      (SideEffectNoResult.Inst (MInst.JTSequence ridx targets)))
+(decl jt_sequence (Reg MachLabel Cond BoxVecMachLabel) ConsumesFlags)
+(rule (jt_sequence ridx default default_cond targets)
+      (ConsumesFlags.ConsumesFlagsSideEffect (MInst.JTSequence ridx default default_cond targets)))
 
+;; Emit a jump-table sequence based on a boolean condition for the
+;; default label.
+(decl jt_sequence_default_bool (Reg MachLabel ProducesBool BoxVecMachLabel) SideEffectNoResult)
+(rule (jt_sequence_default_bool ridx default (ProducesBool.ProducesBool default_producer default_cond) targets)
+      (with_flags_side_effect
+       default_producer
+       (jt_sequence ridx default default_cond targets)))
 
 ;; Helpers for instruction sequences ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -2884,10 +2878,10 @@
 (rule 3 (abi_vec_elt_rev _ $I128 reg) reg)
 (rule 2 (abi_vec_elt_rev _ (ty_scalar_float ty) reg) reg)
 (rule 0 (abi_vec_elt_rev callee_lane_order _ reg)
-      (if-let $true (lane_order_equal callee_lane_order (lane_order)))
+      (if-let true (lane_order_equal callee_lane_order (lane_order)))
       reg)
 (rule 1 (abi_vec_elt_rev callee_lane_order (ty_vec128 ty) reg)
-      (if-let $false (lane_order_equal callee_lane_order (lane_order)))
+      (if-let false (lane_order_equal callee_lane_order (lane_order)))
       (vec_elt_rev ty reg))
 
 ;; Prepare a stack copy of a single (oversized) argument.
@@ -3093,28 +3087,28 @@
 (decl zext32_reg (Type Reg) Reg)
 (rule (zext32_reg ty src)
       (let ((dst WritableReg (temp_writable_reg $I32))
-            (_ Unit (emit (MInst.Extend dst src $false (ty_bits ty) 32))))
+            (_ Unit (emit (MInst.Extend dst src false (ty_bits ty) 32))))
         dst))
 
 ;; Sign-extend a register from a smaller `Type` into a 32-bit register.
 (decl sext32_reg (Type Reg) Reg)
 (rule (sext32_reg ty src)
       (let ((dst WritableReg (temp_writable_reg $I32))
-            (_ Unit (emit (MInst.Extend dst src $true (ty_bits ty) 32))))
+            (_ Unit (emit (MInst.Extend dst src true (ty_bits ty) 32))))
         dst))
 
 ;; Zero-extend a register from a smaller `Type` into a 64-bit register.
 (decl zext64_reg (Type Reg) Reg)
 (rule (zext64_reg ty src)
       (let ((dst WritableReg (temp_writable_reg $I64))
-            (_ Unit (emit (MInst.Extend dst src $false (ty_bits ty) 64))))
+            (_ Unit (emit (MInst.Extend dst src false (ty_bits ty) 64))))
         dst))
 
 ;; Sign-extend a register from a smaller `Type` into a 64-bit register.
 (decl sext64_reg (Type Reg) Reg)
 (rule (sext64_reg ty src)
       (let ((dst WritableReg (temp_writable_reg $I64))
-            (_ Unit (emit (MInst.Extend dst src $true (ty_bits ty) 64))))
+            (_ Unit (emit (MInst.Extend dst src true (ty_bits ty) 64))))
         dst))
 
 
@@ -3357,11 +3351,6 @@
 (decl cond_br_bool (ProducesBool MachLabel MachLabel) SideEffectNoResult)
 (rule (cond_br_bool (ProducesBool.ProducesBool producer cond) taken not_taken)
       (with_flags_side_effect producer (cond_br taken not_taken cond)))
-
-;; Emit a one-way conditional branch based on a boolean condition.
-(decl oneway_cond_br_bool (ProducesBool MachLabel) SideEffectNoResult)
-(rule (oneway_cond_br_bool (ProducesBool.ProducesBool producer cond) dest)
-      (with_flags_side_effect producer (oneway_cond_br dest cond)))
 
 ;; Emit a conditional trap based on a boolean condition.
 (decl trap_if_bool (ProducesBool TrapCode) SideEffectNoResult)

@@ -705,8 +705,12 @@ impl ABIMachineSpec for AArch64MachineDeps {
         // Set this to 3 to keep the max size of the probe to 6 instructions.
         const PROBE_MAX_UNROLL: u32 = 3;
 
-        let probe_count = align_to(frame_size, guard_size) / guard_size;
-        if probe_count <= PROBE_MAX_UNROLL {
+        // Calculate how many probes we need to perform. Round down, as we only
+        // need to probe whole guard_size regions we'd otherwise skip over.
+        let probe_count = frame_size / guard_size;
+        if probe_count == 0 {
+            // No probe necessary
+        } else if probe_count <= PROBE_MAX_UNROLL {
             Self::gen_probestack_unroll(insts, guard_size, probe_count)
         } else {
             Self::gen_probestack_loop(insts, frame_size, guard_size)
@@ -1032,12 +1036,12 @@ impl ABIMachineSpec for AArch64MachineDeps {
 
     fn gen_call(dest: &CallDest, tmp: Writable<Reg>, info: CallInfo<()>) -> SmallVec<[Inst; 2]> {
         let mut insts = SmallVec::new();
-        match &dest {
-            &CallDest::ExtName(ref name, RelocDistance::Near) => {
+        match dest {
+            CallDest::ExtName(name, RelocDistance::Near) => {
                 let info = Box::new(info.map(|()| name.clone()));
                 insts.push(Inst::Call { info });
             }
-            &CallDest::ExtName(ref name, RelocDistance::Far) => {
+            CallDest::ExtName(name, RelocDistance::Far) => {
                 insts.push(Inst::LoadExtName {
                     rd: tmp,
                     name: Box::new(name.clone()),
@@ -1046,7 +1050,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
                 let info = Box::new(info.map(|()| tmp.to_reg()));
                 insts.push(Inst::CallInd { info });
             }
-            &CallDest::Reg(reg) => {
+            CallDest::Reg(reg) => {
                 let info = Box::new(info.map(|()| *reg));
                 insts.push(Inst::CallInd { info });
             }
@@ -1119,8 +1123,11 @@ impl ABIMachineSpec for AArch64MachineDeps {
         }
     }
 
-    fn get_regs_clobbered_by_call(_call_conv: isa::CallConv) -> PRegSet {
-        DEFAULT_AAPCS_CLOBBERS
+    fn get_regs_clobbered_by_call(call_conv: isa::CallConv) -> PRegSet {
+        match call_conv {
+            isa::CallConv::Winch => WINCH_CLOBBERS,
+            _ => DEFAULT_AAPCS_CLOBBERS,
+        }
     }
 
     fn get_ext_mode(
@@ -1434,7 +1441,78 @@ const fn default_aapcs_clobbers() -> PRegSet {
         .with(vreg_preg(31))
 }
 
+const fn winch_clobbers() -> PRegSet {
+    PRegSet::empty()
+        .with(xreg_preg(0))
+        .with(xreg_preg(1))
+        .with(xreg_preg(2))
+        .with(xreg_preg(3))
+        .with(xreg_preg(4))
+        .with(xreg_preg(5))
+        .with(xreg_preg(6))
+        .with(xreg_preg(7))
+        .with(xreg_preg(8))
+        .with(xreg_preg(9))
+        .with(xreg_preg(10))
+        .with(xreg_preg(11))
+        .with(xreg_preg(12))
+        .with(xreg_preg(13))
+        .with(xreg_preg(14))
+        .with(xreg_preg(15))
+        .with(xreg_preg(16))
+        .with(xreg_preg(17))
+        // x18 is used to carry platform state and is not allocatable by Winch.
+        //
+        // x19 - x27 are considered caller-saved in Winch's calling convention.
+        .with(xreg_preg(19))
+        .with(xreg_preg(20))
+        .with(xreg_preg(21))
+        .with(xreg_preg(22))
+        .with(xreg_preg(23))
+        .with(xreg_preg(24))
+        .with(xreg_preg(25))
+        .with(xreg_preg(26))
+        .with(xreg_preg(27))
+        // x28 is used as the shadow stack pointer and is considered
+        // callee-saved.
+        //
+        // All vregs are considered caller-saved.
+        .with(vreg_preg(0))
+        .with(vreg_preg(1))
+        .with(vreg_preg(2))
+        .with(vreg_preg(3))
+        .with(vreg_preg(4))
+        .with(vreg_preg(5))
+        .with(vreg_preg(6))
+        .with(vreg_preg(7))
+        .with(vreg_preg(8))
+        .with(vreg_preg(9))
+        .with(vreg_preg(10))
+        .with(vreg_preg(11))
+        .with(vreg_preg(12))
+        .with(vreg_preg(13))
+        .with(vreg_preg(14))
+        .with(vreg_preg(15))
+        .with(vreg_preg(16))
+        .with(vreg_preg(17))
+        .with(vreg_preg(18))
+        .with(vreg_preg(19))
+        .with(vreg_preg(20))
+        .with(vreg_preg(21))
+        .with(vreg_preg(22))
+        .with(vreg_preg(23))
+        .with(vreg_preg(24))
+        .with(vreg_preg(25))
+        .with(vreg_preg(26))
+        .with(vreg_preg(27))
+        .with(vreg_preg(28))
+        .with(vreg_preg(29))
+        .with(vreg_preg(30))
+        .with(vreg_preg(31))
+}
+
 const DEFAULT_AAPCS_CLOBBERS: PRegSet = default_aapcs_clobbers();
+const WINCH_CLOBBERS: PRegSet = winch_clobbers();
 
 fn create_reg_env(enable_pinned_reg: bool) -> MachineEnv {
     fn preg(r: Reg) -> PReg {

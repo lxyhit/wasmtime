@@ -116,11 +116,11 @@
 ;; Get or match the invalid register.
 (decl invalid_reg () Reg)
 (extern constructor invalid_reg invalid_reg)
-(extractor (invalid_reg) (is_valid_reg $false))
+(extractor (invalid_reg) (is_valid_reg false))
 
 ;; Match any register but the invalid register.
 (decl valid_reg (Reg) Reg)
-(extractor (valid_reg reg) (and (is_valid_reg $true) reg))
+(extractor (valid_reg reg) (and (is_valid_reg true) reg))
 
 ;; Mark this value as used, to ensure that it gets lowered.
 (decl mark_value_used (Value) Unit)
@@ -306,11 +306,23 @@
 (decl def_inst (Inst) Value)
 (extern extractor def_inst def_inst)
 
+(decl u8_from_iconst (u8) Value)
+(extractor (u8_from_iconst x)
+           (def_inst (iconst (uimm8 x))))
+
+(decl u32_from_iconst (u32) Value)
+(extractor (u32_from_iconst x)
+           (u64_from_iconst (u64_as_u32 x)))
+
 ;; Extract a constant `u64` from a value defined by an `iconst`.
 (spec (u64_from_iconst arg) (provide (= arg (zero_ext 64 result))))
 (decl u64_from_iconst (u64) Value)
 (extractor (u64_from_iconst x)
            (def_inst (iconst (u64_from_imm64 x))))
+
+(decl i8_from_iconst (i8) Value)
+(extractor (i8_from_iconst x)
+           (i32_from_iconst (i32_as_i8 x)))
 
 ;; Extract a constant `i32` from a value defined by an `iconst`.
 ;; The value is sign extended to 32 bits.
@@ -345,6 +357,36 @@
              (= (widthof arg) 8)))
 (decl uimm8 (u8) Imm64)
 (extern extractor uimm8 uimm8)
+
+(decl eq (Value Value) Value)
+(extractor (eq x y) (icmp (IntCC.Equal) x y))
+
+(decl ne (Value Value) Value)
+(extractor (ne x y) (icmp (IntCC.NotEqual) x y))
+
+(decl ult (Value Value) Value)
+(extractor (ult x y) (icmp (IntCC.UnsignedLessThan) x y))
+
+(decl ule (Value Value) Value)
+(extractor (ule x y) (icmp (IntCC.UnsignedLessThanOrEqual) x y))
+
+(decl ugt (Value Value) Value)
+(extractor (ugt x y) (icmp (IntCC.UnsignedGreaterThan) x y))
+
+(decl uge (Value Value) Value)
+(extractor (uge x y) (icmp (IntCC.UnsignedGreaterThanOrEqual) x y))
+
+(decl slt (Value Value) Value)
+(extractor (slt x y) (icmp (IntCC.SignedLessThan) x y))
+
+(decl sle (Value Value) Value)
+(extractor (sle x y) (icmp (IntCC.SignedLessThanOrEqual) x y))
+
+(decl sgt (Value Value) Value)
+(extractor (sgt x y) (icmp (IntCC.SignedGreaterThan) x y))
+
+(decl sge (Value Value) Value)
+(extractor (sge x y) (icmp (IntCC.SignedGreaterThanOrEqual) x y))
 
 ;; Instruction creation helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 

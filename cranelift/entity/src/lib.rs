@@ -145,7 +145,7 @@ macro_rules! entity_impl {
 
         impl $entity {
             /// Create a new instance from a `u32`.
-            #[allow(dead_code)]
+            #[allow(dead_code, reason = "macro-generated code")]
             #[inline]
             pub fn from_u32(x: u32) -> Self {
                 debug_assert!(x < $crate::__core::u32::MAX);
@@ -153,21 +153,33 @@ macro_rules! entity_impl {
             }
 
             /// Return the underlying index value as a `u32`.
-            #[allow(dead_code)]
+            #[allow(dead_code, reason = "macro-generated code")]
             #[inline]
             pub fn as_u32(self) -> u32 {
                 self.0
             }
 
             /// Return the raw bit encoding for this instance.
-            #[allow(dead_code)]
+            ///
+            /// __Warning__: the raw bit encoding is opaque and has no
+            /// guaranteed correspondence to the entity's index. It encodes the
+            /// entire state of this index value: either a valid index or an
+            /// invalid-index sentinel. The value returned by this method should
+            /// only be passed to `from_bits`.
+            #[allow(dead_code, reason = "macro-generated code")]
             #[inline]
             pub fn as_bits(self) -> u32 {
                 self.0
             }
 
             /// Create a new instance from the raw bit encoding.
-            #[allow(dead_code)]
+            ///
+            /// __Warning__: the raw bit encoding is opaque and has no
+            /// guaranteed correspondence to the entity's index. It encodes the
+            /// entire state of this index value: either a valid index or an
+            /// invalid-index sentinel. The value returned by this method should
+            /// only be given bits from `as_bits`.
+            #[allow(dead_code, reason = "macro-generated code")]
             #[inline]
             pub fn from_bits(x: u32) -> Self {
                 $entity(x)
@@ -225,7 +237,7 @@ macro_rules! entity_impl {
 
         impl $entity {
             /// Create a new instance from a `u32`.
-            #[allow(dead_code)]
+            #[allow(dead_code, reason = "macro-generated code")]
             #[inline]
             pub fn from_u32(x: u32) -> Self {
                 debug_assert!(x < $crate::__core::u32::MAX);
@@ -234,7 +246,7 @@ macro_rules! entity_impl {
             }
 
             /// Return the underlying index value as a `u32`.
-            #[allow(dead_code)]
+            #[allow(dead_code, reason = "macro-generated code")]
             #[inline]
             pub fn as_u32(self) -> u32 {
                 let $arg = self;
@@ -275,7 +287,7 @@ pub use self::keys::Keys;
 pub use self::list::{EntityList, ListPool};
 pub use self::map::SecondaryMap;
 pub use self::primary::PrimaryMap;
-pub use self::set::EntitySet;
+pub use self::set::{EntitySet, SetIter};
 pub use self::signed::Signed;
 pub use self::sparse::{SparseMap, SparseMapValue, SparseSet};
 pub use self::unsigned::Unsigned;

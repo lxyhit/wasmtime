@@ -154,7 +154,9 @@ impl GcCompiler for NullCompiler {
         array_type_index: TypeIndex,
         init: super::ArrayInit<'_>,
     ) -> WasmResult<ir::Value> {
-        let interned_type_index = func_env.module.types[array_type_index];
+        let interned_type_index =
+            func_env.module.types[array_type_index].unwrap_module_type_index();
+        let ptr_ty = func_env.pointer_type();
 
         let len_offset = gc_compiler(func_env)?.layouts().array_length_field_offset();
         let array_layout = func_env.array_layout(interned_type_index).clone();
@@ -164,7 +166,8 @@ impl GcCompiler for NullCompiler {
 
         // First, compute the array's total size from its base size, element
         // size, and length.
-        let size = emit_array_size(func_env, builder, &array_layout, init);
+        let len = init.len(&mut builder.cursor());
+        let size = emit_array_size(func_env, builder, &array_layout, len);
 
         // Next, allocate the array.
         assert!(align.is_power_of_two());
@@ -190,9 +193,7 @@ impl GcCompiler for NullCompiler {
             .store(ir::MemFlags::trusted(), len, len_addr, 0);
 
         // Finally, initialize the elements.
-        let len_to_elems_delta = builder
-            .ins()
-            .iconst(ir::types::I64, i64::from(len_to_elems_delta));
+        let len_to_elems_delta = builder.ins().iconst(ptr_ty, i64::from(len_to_elems_delta));
         let elems_addr = builder.ins().iadd(len_addr, len_to_elems_delta);
         init.initialize(
             func_env,
@@ -216,7 +217,8 @@ impl GcCompiler for NullCompiler {
         struct_type_index: TypeIndex,
         field_vals: &[ir::Value],
     ) -> WasmResult<ir::Value> {
-        let interned_type_index = func_env.module.types[struct_type_index];
+        let interned_type_index =
+            func_env.module.types[struct_type_index].unwrap_module_type_index();
         let struct_layout = func_env.struct_layout(interned_type_index);
 
         // Copy some stuff out of the struct layout to avoid borrowing issues.

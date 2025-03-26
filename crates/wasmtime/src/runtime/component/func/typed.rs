@@ -17,6 +17,9 @@ use wasmtime_environ::component::{
     MAX_FLAT_RESULTS,
 };
 
+#[cfg(feature = "component-model-async")]
+use crate::component::concurrent::Promise;
+
 /// A statically-typed version of [`Func`] which takes `Params` as input and
 /// returns `Return`.
 ///
@@ -190,6 +193,31 @@ where
             .await?
     }
 
+    /// Start concurrent call to this function.
+    ///
+    /// Unlike [`Self::call`] and [`Self::call_async`] (both of which require
+    /// exclusive access to the store until the completion of the call), calls
+    /// made using this method may run concurrently with other calls to the same
+    /// instance.
+    #[cfg(feature = "component-model-async")]
+    pub async fn call_concurrent<T: Send>(
+        self,
+        mut store: impl AsContextMut<Data = T>,
+        params: Params,
+    ) -> Result<Promise<Return>>
+    where
+        Params: Send + Sync + 'static,
+        Return: Send + Sync + 'static,
+    {
+        let store = store.as_context_mut();
+        assert!(
+            store.0.async_support(),
+            "cannot use `call_concurrent` when async support is not enabled on the config"
+        );
+        _ = params;
+        todo!()
+    }
+
     fn call_impl(&self, mut store: impl AsContextMut, params: Params) -> Result<Return> {
         let store = &mut store.as_context_mut();
         // Note that this is in theory simpler than it might read at this time.
@@ -314,9 +342,9 @@ where
         dst: &ValRaw,
     ) -> Result<Return> {
         assert!(Return::flatten_count() > MAX_FLAT_RESULTS);
-        // FIXME: needs to read an i64 for memory64
-        let ptr = usize::try_from(dst.get_u32()).err2anyhow()?;
-        if ptr % usize::try_from(Return::ALIGN32).err2anyhow()? != 0 {
+        // FIXME(#4311): needs to read an i64 for memory64
+        let ptr = usize::try_from(dst.get_u32())?;
+        if ptr % usize::try_from(Return::ALIGN32)? != 0 {
             bail!("return pointer not aligned");
         }
 
@@ -875,19 +903,6 @@ integers! {
 
 macro_rules! floats {
     ($($float:ident/$get_float:ident = $ty:ident with abi:$abi:ident)*) => ($(const _: () = {
-        /// All floats in-and-out of the canonical abi always have their nan
-        /// payloads canonicalized. conveniently the `NAN` constant in rust has
-        /// the same representation as canonical nan, so we can use that for the
-        /// nan value.
-        #[inline]
-        fn canonicalize(float: $float) -> $float {
-            if float.is_nan() {
-                $float::NAN
-            } else {
-                float
-            }
-        }
-
         unsafe impl ComponentType for $float {
             type Lower = ValRaw;
 
@@ -910,7 +925,7 @@ macro_rules! floats {
                 dst: &mut MaybeUninit<Self::Lower>,
             ) -> Result<()> {
                 debug_assert!(matches!(ty, InterfaceType::$ty));
-                dst.write(ValRaw::$float(canonicalize(*self).to_bits()));
+                dst.write(ValRaw::$float(self.to_bits()));
                 Ok(())
             }
 
@@ -924,7 +939,7 @@ macro_rules! floats {
                 debug_assert!(matches!(ty, InterfaceType::$ty));
                 debug_assert!(offset % Self::SIZE32 == 0);
                 let ptr = cx.get(offset);
-                *ptr = canonicalize(*self).to_bits().to_le_bytes();
+                *ptr = self.to_bits().to_le_bytes();
                 Ok(())
             }
         }
@@ -933,14 +948,14 @@ macro_rules! floats {
             #[inline]
             fn lift(_cx: &mut LiftContext<'_>, ty: InterfaceType, src: &Self::Lower) -> Result<Self> {
                 debug_assert!(matches!(ty, InterfaceType::$ty));
-                Ok(canonicalize($float::from_bits(src.$get_float())))
+                Ok($float::from_bits(src.$get_float()))
             }
 
             #[inline]
             fn load(_cx: &mut LiftContext<'_>, ty: InterfaceType, bytes: &[u8]) -> Result<Self> {
                 debug_assert!(matches!(ty, InterfaceType::$ty));
                 debug_assert!((bytes.as_ptr() as usize) % Self::SIZE32 == 0);
-                Ok(canonicalize($float::from_le_bytes(bytes.try_into().unwrap())))
+                Ok($float::from_le_bytes(bytes.try_into().unwrap()))
             }
         }
     };)*)
@@ -1053,7 +1068,7 @@ unsafe impl Lift for char {
     #[inline]
     fn lift(_cx: &mut LiftContext<'_>, ty: InterfaceType, src: &Self::Lower) -> Result<Self> {
         debug_assert!(matches!(ty, InterfaceType::Char));
-        Ok(char::try_from(src.get_u32()).err2anyhow()?)
+        Ok(char::try_from(src.get_u32())?)
     }
 
     #[inline]
@@ -1061,11 +1076,11 @@ unsafe impl Lift for char {
         debug_assert!(matches!(ty, InterfaceType::Char));
         debug_assert!((bytes.as_ptr() as usize) % Self::SIZE32 == 0);
         let bits = u32::from_le_bytes(bytes.try_into().unwrap());
-        Ok(char::try_from(bits).err2anyhow()?)
+        Ok(char::try_from(bits)?)
     }
 }
 
-// TODO: these probably need different constants for memory64
+// FIXME(#4311): these probably need different constants for memory64
 const UTF16_TAG: usize = 1 << 31;
 const MAX_STRING_BYTE_LENGTH: usize = (1 << 31) - 1;
 
@@ -1109,7 +1124,7 @@ unsafe impl Lower for str {
         debug_assert!(matches!(ty, InterfaceType::String));
         debug_assert!(offset % (Self::ALIGN32 as usize) == 0);
         let (ptr, len) = lower_string(cx, self)?;
-        // FIXME: needs memory64 handling
+        // FIXME(#4311): needs memory64 handling
         *cx.get(offset + 0) = u32::try_from(ptr).unwrap().to_le_bytes();
         *cx.get(offset + 4) = u32::try_from(len).unwrap().to_le_bytes();
         Ok(())
@@ -1337,9 +1352,7 @@ impl WasmStr {
         // Note that bounds-checking already happen in construction of `WasmStr`
         // so this is never expected to panic. This could theoretically be
         // unchecked indexing if we're feeling wild enough.
-        Ok(str::from_utf8(&memory[self.ptr..][..self.len])
-            .err2anyhow()?
-            .into())
+        Ok(str::from_utf8(&memory[self.ptr..][..self.len])?.into())
     }
 
     fn decode_utf16<'a>(&self, memory: &'a [u8], len: usize) -> Result<Cow<'a, str>> {
@@ -1350,8 +1363,7 @@ impl WasmStr {
                 .chunks(2)
                 .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap())),
         )
-        .collect::<Result<String, _>>()
-        .err2anyhow()?
+        .collect::<Result<String, _>>()?
         .into())
     }
 
@@ -1382,13 +1394,10 @@ unsafe impl Lift for WasmStr {
     #[inline]
     fn lift(cx: &mut LiftContext<'_>, ty: InterfaceType, src: &Self::Lower) -> Result<Self> {
         debug_assert!(matches!(ty, InterfaceType::String));
-        // FIXME: needs memory64 treatment
+        // FIXME(#4311): needs memory64 treatment
         let ptr = src[0].get_u32();
         let len = src[1].get_u32();
-        let (ptr, len) = (
-            usize::try_from(ptr).err2anyhow()?,
-            usize::try_from(len).err2anyhow()?,
-        );
+        let (ptr, len) = (usize::try_from(ptr)?, usize::try_from(len)?);
         WasmStr::new(ptr, len, cx)
     }
 
@@ -1396,13 +1405,10 @@ unsafe impl Lift for WasmStr {
     fn load(cx: &mut LiftContext<'_>, ty: InterfaceType, bytes: &[u8]) -> Result<Self> {
         debug_assert!(matches!(ty, InterfaceType::String));
         debug_assert!((bytes.as_ptr() as usize) % (Self::ALIGN32 as usize) == 0);
-        // FIXME: needs memory64 treatment
+        // FIXME(#4311): needs memory64 treatment
         let ptr = u32::from_le_bytes(bytes[..4].try_into().unwrap());
         let len = u32::from_le_bytes(bytes[4..].try_into().unwrap());
-        let (ptr, len) = (
-            usize::try_from(ptr).err2anyhow()?,
-            usize::try_from(len).err2anyhow()?,
-        );
+        let (ptr, len) = (usize::try_from(ptr)?, usize::try_from(len)?);
         WasmStr::new(ptr, len, cx)
     }
 }
@@ -1539,7 +1545,7 @@ impl<T: Lift> WasmList<T> {
             Some(n) if n <= cx.memory().len() => {}
             _ => bail!("list pointer/length out of bounds of memory"),
         }
-        if ptr % usize::try_from(T::ALIGN32).err2anyhow()? != 0 {
+        if ptr % usize::try_from(T::ALIGN32)? != 0 {
             bail!("list pointer is not aligned")
         }
         Ok(WasmList {
@@ -1692,13 +1698,10 @@ unsafe impl<T: Lift> Lift for WasmList<T> {
             InterfaceType::List(i) => cx.types[i].element,
             _ => bad_type_info(),
         };
-        // FIXME: needs memory64 treatment
+        // FIXME(#4311): needs memory64 treatment
         let ptr = src[0].get_u32();
         let len = src[1].get_u32();
-        let (ptr, len) = (
-            usize::try_from(ptr).err2anyhow()?,
-            usize::try_from(len).err2anyhow()?,
-        );
+        let (ptr, len) = (usize::try_from(ptr)?, usize::try_from(len)?);
         WasmList::new(ptr, len, cx, elem)
     }
 
@@ -1708,13 +1711,10 @@ unsafe impl<T: Lift> Lift for WasmList<T> {
             _ => bad_type_info(),
         };
         debug_assert!((bytes.as_ptr() as usize) % (Self::ALIGN32 as usize) == 0);
-        // FIXME: needs memory64 treatment
+        // FIXME(#4311): needs memory64 treatment
         let ptr = u32::from_le_bytes(bytes[..4].try_into().unwrap());
         let len = u32::from_le_bytes(bytes[4..].try_into().unwrap());
-        let (ptr, len) = (
-            usize::try_from(ptr).err2anyhow()?,
-            usize::try_from(len).err2anyhow()?,
-        );
+        let (ptr, len) = (usize::try_from(ptr)?, usize::try_from(len)?);
         WasmList::new(ptr, len, cx, elem)
     }
 }
@@ -1908,7 +1908,7 @@ unsafe impl<T> ComponentType for Option<T>
 where
     T: ComponentType,
 {
-    type Lower = TupleLower2<<u32 as ComponentType>::Lower, T::Lower>;
+    type Lower = TupleLower<<u32 as ComponentType>::Lower, T::Lower>;
 
     const ABI: CanonicalAbiInfo = CanonicalAbiInfo::variant_static(&[None, Some(T::ABI)]);
 
@@ -2330,22 +2330,61 @@ where
     unsafe { MaybeUninit::uninit().assume_init() }
 }
 
-macro_rules! impl_component_ty_for_tuples {
-    ($n:tt $($t:ident)*) => {paste::paste!{
-        #[allow(non_snake_case)]
-        #[doc(hidden)]
-        #[derive(Clone, Copy)]
-        #[repr(C)]
-        pub struct [<TupleLower$n>]<$($t),*> {
-            $($t: $t,)*
-            _align_tuple_lower0_correctly: [ValRaw; 0],
-        }
+/// Helper structure to define `Lower` for tuples below.
+///
+/// Uses default type parameters to have fields be zero-sized and not present
+/// in memory for smaller tuple values.
+#[allow(non_snake_case)]
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct TupleLower<
+    T1 = (),
+    T2 = (),
+    T3 = (),
+    T4 = (),
+    T5 = (),
+    T6 = (),
+    T7 = (),
+    T8 = (),
+    T9 = (),
+    T10 = (),
+    T11 = (),
+    T12 = (),
+    T13 = (),
+    T14 = (),
+    T15 = (),
+    T16 = (),
+    T17 = (),
+> {
+    // NB: these names match the names in `for_each_function_signature!`
+    A1: T1,
+    A2: T2,
+    A3: T3,
+    A4: T4,
+    A5: T5,
+    A6: T6,
+    A7: T7,
+    A8: T8,
+    A9: T9,
+    A10: T10,
+    A11: T11,
+    A12: T12,
+    A13: T13,
+    A14: T14,
+    A15: T15,
+    A16: T16,
+    A17: T17,
+    _align_tuple_lower0_correctly: [ValRaw; 0],
+}
 
+macro_rules! impl_component_ty_for_tuples {
+    ($n:tt $($t:ident)*) => {
         #[allow(non_snake_case)]
         unsafe impl<$($t,)*> ComponentType for ($($t,)*)
             where $($t: ComponentType),*
         {
-            type Lower = [<TupleLower$n>]<$($t::Lower),*>;
+            type Lower = TupleLower<$($t::Lower),*>;
 
             const ABI: CanonicalAbiInfo = CanonicalAbiInfo::record_static(&[
                 $($t::ABI),*
@@ -2453,7 +2492,7 @@ macro_rules! impl_component_ty_for_tuples {
         unsafe impl<$($t,)*> ComponentNamedList for ($($t,)*)
             where $($t: ComponentType),*
         {}
-    }};
+    };
 }
 
 for_each_function_signature!(impl_component_ty_for_tuples);
@@ -2484,6 +2523,9 @@ pub fn desc(ty: &InterfaceType) -> &'static str {
         InterfaceType::Enum(_) => "enum",
         InterfaceType::Own(_) => "owned resource",
         InterfaceType::Borrow(_) => "borrowed resource",
+        InterfaceType::Future(_) => "future",
+        InterfaceType::Stream(_) => "stream",
+        InterfaceType::ErrorContext(_) => "error-context",
     }
 }
 

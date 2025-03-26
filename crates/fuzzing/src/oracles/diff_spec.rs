@@ -27,6 +27,7 @@ impl SpecInterpreter {
         config.relaxed_simd_enabled = false;
         config.custom_page_sizes_enabled = false;
         config.wide_arithmetic_enabled = false;
+        config.extended_const_enabled = false;
 
         Self
     }
@@ -43,12 +44,12 @@ impl DiffEngine for SpecInterpreter {
         Ok(Box::new(SpecInstance { instance }))
     }
 
-    fn assert_error_match(&self, trap: &Trap, err: &Error) {
+    fn assert_error_match(&self, err: &Error, trap: &Trap) {
         // TODO: implement this for the spec interpreter
         let _ = (trap, err);
     }
 
-    fn is_stack_overflow(&self, err: &Error) -> bool {
+    fn is_non_deterministic_error(&self, err: &Error) -> bool {
         err.to_string().contains("(Isabelle) call stack exhausted")
     }
 }

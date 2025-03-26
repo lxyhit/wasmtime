@@ -2,19 +2,20 @@ use crate::linker::{Definition, DefinitionType};
 use crate::prelude::*;
 use crate::runtime::vm::{
     Imports, InstanceAllocationRequest, ModuleRuntimeInfo, StorePtr, VMFuncRef, VMFunctionImport,
-    VMGlobalImport, VMMemoryImport, VMOpaqueContext, VMTableImport,
+    VMGlobalImport, VMMemoryImport, VMOpaqueContext, VMTableImport, VMTagImport,
 };
 use crate::store::{InstanceId, StoreOpaque, Stored};
 use crate::types::matching;
 use crate::{
     AsContextMut, Engine, Export, Extern, Func, Global, Memory, Module, ModuleExport, SharedMemory,
-    StoreContext, StoreContextMut, Table, TypedFunc,
+    StoreContext, StoreContextMut, Table, Tag, TypedFunc,
 };
 use alloc::sync::Arc;
 use core::ptr::NonNull;
 use wasmparser::WasmFeatures;
 use wasmtime_environ::{
-    EntityIndex, EntityType, FuncIndex, GlobalIndex, MemoryIndex, PrimaryMap, TableIndex, TypeTrace,
+    EntityIndex, EntityType, FuncIndex, GlobalIndex, MemoryIndex, PrimaryMap, TableIndex, TagIndex,
+    TypeTrace,
 };
 
 /// An instantiated WebAssembly module.
@@ -361,13 +362,11 @@ impl Instance {
         let f = instance.get_exported_func(start);
         let caller_vmctx = instance.vmctx();
         unsafe {
-            super::func::invoke_wasm_and_catch_traps(store, |_default_caller| {
-                let func = f.func_ref.as_ref().array_call;
-                func(
-                    f.func_ref.as_ref().vmctx,
+            super::func::invoke_wasm_and_catch_traps(store, |_default_caller, vm| {
+                f.func_ref.as_ref().array_call(
+                    vm,
                     VMOpaqueContext::from_vmcontext(caller_vmctx),
-                    [].as_mut_ptr(),
-                    0,
+                    NonNull::from(&mut []),
                 )
             })?;
         }
@@ -595,6 +594,18 @@ impl Instance {
         self.get_export(store, name)?.into_global()
     }
 
+    /// Looks up a tag [`Tag`] by name.
+    ///
+    /// Returns `None` if there was no export named `name`, or if there was but
+    /// it wasn't a tag.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `store` does not own this instance.
+    pub fn get_tag(&self, store: impl AsContextMut, name: &str) -> Option<Tag> {
+        self.get_export(store, name)?.into_tag()
+    }
+
     #[cfg(feature = "component-model")]
     pub(crate) fn id(&self, store: &StoreOpaque) -> InstanceId {
         store[self.0].id
@@ -607,6 +618,7 @@ impl Instance {
     /// Returns both exported and non-exported globals.
     ///
     /// Gives access to the full globals space.
+    #[cfg(feature = "coredump")]
     pub(crate) fn all_globals<'a>(
         &'a self,
         store: &'a mut StoreOpaque,
@@ -627,6 +639,7 @@ impl Instance {
     /// Returns both exported and non-exported memories.
     ///
     /// Gives access to the full memories space.
+    #[cfg(feature = "coredump")]
     pub(crate) fn all_memories<'a>(
         &'a self,
         store: &'a mut StoreOpaque,
@@ -646,6 +659,7 @@ pub(crate) struct OwnedImports {
     tables: PrimaryMap<TableIndex, VMTableImport>,
     memories: PrimaryMap<MemoryIndex, VMMemoryImport>,
     globals: PrimaryMap<GlobalIndex, VMGlobalImport>,
+    tags: PrimaryMap<TagIndex, VMTagImport>,
 }
 
 impl OwnedImports {
@@ -661,6 +675,7 @@ impl OwnedImports {
             tables: PrimaryMap::new(),
             memories: PrimaryMap::new(),
             globals: PrimaryMap::new(),
+            tags: PrimaryMap::new(),
         }
     }
 
@@ -670,6 +685,7 @@ impl OwnedImports {
         self.tables.reserve(raw.num_imported_tables);
         self.memories.reserve(raw.num_imported_memories);
         self.globals.reserve(raw.num_imported_globals);
+        self.tags.reserve(raw.num_imported_tags);
     }
 
     #[cfg(feature = "component-model")]
@@ -678,6 +694,7 @@ impl OwnedImports {
         self.tables.clear();
         self.memories.clear();
         self.globals.clear();
+        self.tags.clear();
     }
 
     fn push(&mut self, item: &Extern, store: &mut StoreOpaque, module: &Module) {
@@ -697,6 +714,9 @@ impl OwnedImports {
             Extern::SharedMemory(i) => {
                 self.memories.push(i.vmimport(store));
             }
+            Extern::Tag(i) => {
+                self.tags.push(i.vmimport(store));
+            }
         }
     }
 
@@ -714,19 +734,26 @@ impl OwnedImports {
                 });
             }
             crate::runtime::vm::Export::Global(g) => {
-                self.globals.push(VMGlobalImport { from: g.definition });
+                self.globals.push(VMGlobalImport {
+                    from: g.definition.into(),
+                });
             }
             crate::runtime::vm::Export::Table(t) => {
                 self.tables.push(VMTableImport {
-                    from: t.definition,
-                    vmctx: t.vmctx,
+                    from: t.definition.into(),
+                    vmctx: t.vmctx.into(),
                 });
             }
             crate::runtime::vm::Export::Memory(m) => {
                 self.memories.push(VMMemoryImport {
-                    from: m.definition,
-                    vmctx: m.vmctx,
+                    from: m.definition.into(),
+                    vmctx: m.vmctx.into(),
                     index: m.index,
+                });
+            }
+            crate::runtime::vm::Export::Tag(t) => {
+                self.tags.push(VMTagImport {
+                    from: t.definition.into(),
                 });
             }
         }
@@ -738,6 +765,7 @@ impl OwnedImports {
             globals: self.globals.values().as_slice(),
             memories: self.memories.values().as_slice(),
             functions: self.functions.values().as_slice(),
+            tags: self.tags.values().as_slice(),
         }
     }
 }
@@ -820,7 +848,9 @@ impl<T> InstancePre<T> {
                         // Wasm-to-native trampoline.
                         debug_assert!(matches!(f.host_ctx(), crate::HostContext::Array(_)));
                         func_refs.push(VMFuncRef {
-                            wasm_call: module.wasm_to_array_trampoline(f.sig_index()),
+                            wasm_call: module
+                                .wasm_to_array_trampoline(f.sig_index())
+                                .map(|f| f.into()),
                             ..*f.func_ref()
                         });
                     }
@@ -978,11 +1008,8 @@ fn typecheck<I>(
         bail!("expected {expected_len} imports, found {actual_len}");
     }
     let cx = matching::MatchCx::new(module.engine());
-    for ((name, field, mut expected_ty), actual) in env_module.imports().zip(import_args) {
-        expected_ty.canonicalize_for_runtime_usage(&mut |module_index| {
-            module.signatures().shared_type(module_index).unwrap()
-        });
-
+    for ((name, field, expected_ty), actual) in env_module.imports().zip(import_args) {
+        debug_assert!(expected_ty.is_canonicalized_for_runtime_usage());
         check(&cx, &expected_ty, actual)
             .with_context(|| format!("incompatible import type for `{name}::{field}`"))?;
     }

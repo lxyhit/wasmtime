@@ -6,16 +6,20 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
+use tokio::sync::Notify;
 use wasmtime::component::Linker;
-use wasmtime::{Config, Engine, Memory, MemoryType, Store, StoreLimits};
-use wasmtime_wasi::{StreamError, StreamResult, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime::{Engine, Store, StoreLimits};
+use wasmtime_wasi::{IoView, StreamError, StreamResult, WasiCtx, WasiCtxBuilder, WasiView};
 use wasmtime_wasi_http::bindings::http::types::Scheme;
 use wasmtime_wasi_http::bindings::ProxyPre;
 use wasmtime_wasi_http::io::TokioIo;
-use wasmtime_wasi_http::{body::HyperOutgoingBody, WasiHttpCtx, WasiHttpView};
+use wasmtime_wasi_http::{
+    body::HyperOutgoingBody, WasiHttpCtx, WasiHttpView, DEFAULT_OUTGOING_BODY_BUFFER_CHUNKS,
+    DEFAULT_OUTGOING_BODY_CHUNK_SIZE,
+};
 
 #[cfg(feature = "wasi-config")]
 use wasmtime_wasi_config::{WasiConfig, WasiConfigVariables};
@@ -28,6 +32,8 @@ struct Host {
     table: wasmtime::component::ResourceTable,
     ctx: WasiCtx,
     http: WasiHttpCtx,
+    http_outgoing_body_buffer_chunks: Option<usize>,
+    http_outgoing_body_chunk_size: Option<usize>,
 
     limits: StoreLimits,
 
@@ -41,23 +47,30 @@ struct Host {
     wasi_keyvalue: Option<WasiKeyValueCtx>,
 }
 
-impl WasiView for Host {
+impl IoView for Host {
     fn table(&mut self) -> &mut wasmtime::component::ResourceTable {
         &mut self.table
     }
-
+}
+impl WasiView for Host {
     fn ctx(&mut self) -> &mut WasiCtx {
         &mut self.ctx
     }
 }
 
 impl WasiHttpView for Host {
-    fn table(&mut self) -> &mut wasmtime::component::ResourceTable {
-        &mut self.table
-    }
-
     fn ctx(&mut self) -> &mut WasiHttpCtx {
         &mut self.http
+    }
+
+    fn outgoing_body_buffer_chunks(&mut self) -> usize {
+        self.http_outgoing_body_buffer_chunks
+            .unwrap_or_else(|| DEFAULT_OUTGOING_BODY_BUFFER_CHUNKS)
+    }
+
+    fn outgoing_body_chunk_size(&mut self) -> usize {
+        self.http_outgoing_body_chunk_size
+            .unwrap_or_else(|| DEFAULT_OUTGOING_BODY_CHUNK_SIZE)
     }
 }
 
@@ -67,14 +80,26 @@ const DEFAULT_ADDR: std::net::SocketAddr = std::net::SocketAddr::new(
 );
 
 /// Runs a WebAssembly module
-#[derive(Parser, PartialEq)]
+#[derive(Parser)]
 pub struct ServeCommand {
     #[command(flatten)]
     run: RunCommon,
 
     /// Socket address for the web server to bind to.
-    #[arg(long = "addr", value_name = "SOCKADDR", default_value_t = DEFAULT_ADDR )]
+    #[arg(long , value_name = "SOCKADDR", default_value_t = DEFAULT_ADDR)]
     addr: SocketAddr,
+
+    /// Socket address where, when connected to, will initiate a graceful
+    /// shutdown.
+    ///
+    /// Note that graceful shutdown is also supported on ctrl-c.
+    #[arg(long, value_name = "SOCKADDR")]
+    shutdown_addr: Option<SocketAddr>,
+
+    /// Disable log prefixes of wasi-http handlers.
+    /// if unspecified, logs will be prefixed with 'stdout|stderr [{req_id}] :: '
+    #[arg(long)]
+    no_logging_prefix: bool,
 
     /// The WebAssembly component to run.
     #[arg(value_name = "WASM", required = true)]
@@ -117,17 +142,7 @@ impl ServeCommand {
             .enable_io()
             .build()?;
 
-        runtime.block_on(async move {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    Ok::<_, anyhow::Error>(())
-                }
-
-                res = self.serve() => {
-                    res
-                }
-            }
-        })?;
+        runtime.block_on(self.serve())?;
 
         Ok(())
     }
@@ -138,20 +153,24 @@ impl ServeCommand {
 
         builder.env("REQUEST_ID", req_id.to_string());
 
-        builder.stdout(LogStream::new(
-            format!("stdout [{req_id}] :: "),
-            Output::Stdout,
-        ));
-
-        builder.stderr(LogStream::new(
-            format!("stderr [{req_id}] :: "),
-            Output::Stderr,
-        ));
+        let stdout_prefix: String;
+        let stderr_prefix: String;
+        if self.no_logging_prefix {
+            stdout_prefix = "".to_string();
+            stderr_prefix = "".to_string();
+        } else {
+            stdout_prefix = format!("stdout [{req_id}] :: ");
+            stderr_prefix = format!("stderr [{req_id}] :: ");
+        }
+        builder.stdout(LogStream::new(stdout_prefix, Output::Stdout));
+        builder.stderr(LogStream::new(stderr_prefix, Output::Stderr));
 
         let mut host = Host {
             table: wasmtime::component::ResourceTable::new(),
             ctx: builder.build(),
             http: WasiHttpCtx::new(),
+            http_outgoing_body_buffer_chunks: self.run.common.wasi.http_outgoing_body_buffer_chunks,
+            http_outgoing_body_chunk_size: self.run.common.wasi.http_outgoing_body_chunk_size,
 
             limits: StoreLimits::default(),
 
@@ -318,7 +337,7 @@ impl ServeCommand {
         let mut config = self
             .run
             .common
-            .config(None, use_pooling_allocator_by_default().unwrap_or(None))?;
+            .config(use_pooling_allocator_by_default().unwrap_or(None))?;
         config.wasm_component_model(true);
         config.async_support(true);
 
@@ -349,6 +368,30 @@ impl ServeCommand {
 
         let instance = linker.instantiate_pre(&component)?;
         let instance = ProxyPre::new(instance)?;
+
+        // Spawn background task(s) waiting for graceful shutdown signals. This
+        // always listens for ctrl-c but additionally can listen for a TCP
+        // connection to the specified address.
+        let shutdown = Arc::new(GracefulShutdown::default());
+        tokio::task::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                tokio::signal::ctrl_c().await.unwrap();
+                shutdown.requested.notify_one();
+            }
+        });
+        if let Some(addr) = self.shutdown_addr {
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            eprintln!(
+                "Listening for shutdown on tcp://{}/",
+                listener.local_addr()?
+            );
+            let shutdown = shutdown.clone();
+            tokio::task::spawn(async move {
+                let _ = listener.accept().await;
+                shutdown.requested.notify_one();
+            });
+        }
 
         let socket = match &self.addr {
             SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
@@ -382,9 +425,16 @@ impl ServeCommand {
         let handler = ProxyHandler::new(self, engine, instance);
 
         loop {
-            let (stream, _) = listener.accept().await?;
+            // Wait for a socket, but also "race" against shutdown to break out
+            // of this loop. Once the graceful shutdown signal is received then
+            // this loop exits immediately.
+            let (stream, _) = tokio::select! {
+                _ = shutdown.requested.notified() => break,
+                v = listener.accept() => v?,
+            };
             let stream = TokioIo::new(stream);
             let h = handler.clone();
+            let shutdown_guard = shutdown.clone().increment();
             tokio::task::spawn(async {
                 if let Err(e) = http1::Builder::new()
                     .keep_alive(true)
@@ -396,8 +446,75 @@ impl ServeCommand {
                 {
                     eprintln!("error: {e:?}");
                 }
+                drop(shutdown_guard);
             });
         }
+
+        // Upon exiting the loop we'll no longer process any more incoming
+        // connections but there may still be outstanding connections
+        // processing in child tasks. If there are wait for those to complete
+        // before shutting down completely. Also enable short-circuiting this
+        // wait with a second ctrl-c signal.
+        if shutdown.close() {
+            return Ok(());
+        }
+        eprintln!("Waiting for child tasks to exit, ctrl-c again to quit sooner...");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = shutdown.complete.notified() => {}
+        }
+
+        Ok(())
+    }
+}
+
+/// Helper structure to manage graceful shutdown int he accept loop above.
+#[derive(Default)]
+struct GracefulShutdown {
+    /// Async notification that shutdown has been requested.
+    requested: Notify,
+    /// Async notification that shutdown has completed, signaled when
+    /// `notify_when_done` is `true` and `active_tasks` reaches 0.
+    complete: Notify,
+    /// Internal state related to what's in progress when shutdown is requested.
+    state: Mutex<GracefulShutdownState>,
+}
+
+#[derive(Default)]
+struct GracefulShutdownState {
+    active_tasks: u32,
+    notify_when_done: bool,
+}
+
+impl GracefulShutdown {
+    /// Increments the number of active tasks and returns a guard indicating
+    fn increment(self: Arc<Self>) -> impl Drop {
+        struct Guard(Arc<GracefulShutdown>);
+
+        let mut state = self.state.lock().unwrap();
+        assert!(!state.notify_when_done);
+        state.active_tasks += 1;
+        drop(state);
+
+        return Guard(self);
+
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let mut state = self.0.state.lock().unwrap();
+                state.active_tasks -= 1;
+                if state.notify_when_done && state.active_tasks == 0 {
+                    self.0.complete.notify_one();
+                }
+            }
+        }
+    }
+
+    /// Flags this state as done spawning tasks and returns whether there are no
+    /// more child tasks remaining.
+    fn close(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        state.notify_when_done = true;
+        state.active_tasks == 0
     }
 }
 
@@ -494,7 +611,7 @@ async fn handle_request(
             .call_handle(store, req, out)
             .await
         {
-            log::error!("[{req_id}] :: {:#?}", e);
+            log::error!("[{req_id}] :: {:?}", e);
             return Err(e);
         }
 
@@ -513,10 +630,13 @@ async fn handle_request(
             // that we assume the task has already exited at this point so the
             // `await` should resolve immediately.
             let e = match task.await {
-                Ok(r) => r.expect_err("if the receiver has an error, the task must have failed"),
+                Ok(Ok(())) => {
+                    bail!("guest never invoked `response-outparam::set` method")
+                }
+                Ok(Err(e)) => e,
                 Err(e) => e.into(),
             };
-            bail!("guest never invoked `response-outparam::set` method: {e:?}")
+            return Err(e.context("guest never invoked `response-outparam::set` method"));
         }
     }
 }
@@ -557,7 +677,7 @@ impl LogStream {
 }
 
 impl wasmtime_wasi::StdoutStream for LogStream {
-    fn stream(&self) -> Box<dyn wasmtime_wasi::HostOutputStream> {
+    fn stream(&self) -> Box<dyn wasmtime_wasi::OutputStream> {
         Box::new(self.clone())
     }
 
@@ -571,7 +691,7 @@ impl wasmtime_wasi::StdoutStream for LogStream {
     }
 }
 
-impl wasmtime_wasi::HostOutputStream for LogStream {
+impl wasmtime_wasi::OutputStream for LogStream {
     fn write(&mut self, bytes: bytes::Bytes) -> StreamResult<()> {
         let mut bytes = &bytes[..];
 
@@ -613,7 +733,7 @@ impl wasmtime_wasi::HostOutputStream for LogStream {
 }
 
 #[async_trait::async_trait]
-impl wasmtime_wasi::Subscribe for LogStream {
+impl wasmtime_wasi::Pollable for LogStream {
     async fn ready(&mut self) {}
 }
 
@@ -639,6 +759,7 @@ impl wasmtime_wasi::Subscribe for LogStream {
 /// if it fails then the pooling allocator is not used and the normal mmap-based
 /// implementation is used instead.
 fn use_pooling_allocator_by_default() -> Result<Option<bool>> {
+    use wasmtime::{Config, Memory, MemoryType};
     const BITS_TO_TEST: u32 = 42;
     let mut config = Config::new();
     config.wasm_memory64(true);

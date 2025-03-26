@@ -31,6 +31,7 @@ pub(crate) mod func;
 
 pub(crate) mod code;
 pub(crate) mod code_memory;
+#[cfg(feature = "debug-builtins")]
 pub(crate) mod debug;
 pub(crate) mod externals;
 pub(crate) mod gc;
@@ -106,6 +107,9 @@ pub use stack::*;
 mod coredump;
 #[cfg(feature = "coredump")]
 pub use coredump::*;
+
+#[cfg(feature = "wave")]
+mod wave;
 
 fn _assertions_runtime() {
     use crate::_assert_send_and_sync;

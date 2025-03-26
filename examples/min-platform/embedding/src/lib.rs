@@ -3,18 +3,23 @@
 #[macro_use]
 extern crate alloc;
 
+use alloc::string::ToString;
 use anyhow::Result;
+use core::ptr;
 use wasmtime::{Engine, Instance, Linker, Module, Store};
 
 mod allocator;
 mod panic;
+
+#[cfg(feature = "wasi")]
+mod wasi;
 
 /// Entrypoint of this embedding.
 ///
 /// This takes a number of parameters which are the precompiled module AOT
 /// images that are run for each of the various tests below. The first parameter
 /// is also where to put an error string, if any, if anything fails.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn run(
     error_buf: *mut u8,
     error_size: usize,
@@ -53,14 +58,20 @@ fn run_result(
 
 fn smoke(module: &[u8]) -> Result<()> {
     let engine = Engine::default();
-    let module = unsafe { Module::deserialize(&engine, module)? };
+    let module = match deserialize(&engine, module)? {
+        Some(module) => module,
+        None => return Ok(()),
+    };
     Instance::new(&mut Store::new(&engine, ()), &module, &[])?;
     Ok(())
 }
 
 fn simple_add(module: &[u8]) -> Result<()> {
     let engine = Engine::default();
-    let module = unsafe { Module::deserialize(&engine, module)? };
+    let module = match deserialize(&engine, module)? {
+        Some(module) => module,
+        None => return Ok(()),
+    };
     let mut store = Store::new(&engine, ());
     let instance = Linker::new(&engine).instantiate(&mut store, &module)?;
     let func = instance.get_typed_func::<(u32, u32), u32>(&mut store, "add")?;
@@ -70,7 +81,10 @@ fn simple_add(module: &[u8]) -> Result<()> {
 
 fn simple_host_fn(module: &[u8]) -> Result<()> {
     let engine = Engine::default();
-    let module = unsafe { Module::deserialize(&engine, module)? };
+    let module = match deserialize(&engine, module)? {
+        Some(module) => module,
+        None => return Ok(()),
+    };
     let mut linker = Linker::<()>::new(&engine);
     linker.func_wrap("host", "multiply", |a: u32, b: u32| a.saturating_mul(b))?;
     let mut store = Store::new(&engine, ());
@@ -78,4 +92,29 @@ fn simple_host_fn(module: &[u8]) -> Result<()> {
     let func = instance.get_typed_func::<(u32, u32, u32), u32>(&mut store, "add_and_mul")?;
     assert_eq!(func.call(&mut store, (2, 3, 4))?, 10);
     Ok(())
+}
+
+fn deserialize(engine: &Engine, module: &[u8]) -> Result<Option<Module>> {
+    // NOTE: deserialize_raw avoids creating a copy of the module code.  See the
+    // safety notes before using in your embedding.
+    let memory_ptr = ptr::slice_from_raw_parts(module.as_ptr(), module.len());
+    let module_memory = ptr::NonNull::new(memory_ptr.cast_mut()).unwrap();
+    match unsafe { Module::deserialize_raw(engine, module_memory) } {
+        Ok(module) => Ok(Some(module)),
+        Err(e) => {
+            // Currently if custom signals/virtual memory are disabled then this
+            // example is expected to fail to load since loading native code
+            // requires virtual memory. In the future this will go away as when
+            // signals-based-traps is disabled then that means that the
+            // interpreter should be used which should work here.
+            if !cfg!(feature = "custom")
+                && e.to_string()
+                    .contains("requires virtual memory to be enabled")
+            {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }
+    }
 }

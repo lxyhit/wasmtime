@@ -3,30 +3,28 @@
 // Pull in the ISLE generated code.
 pub(crate) mod generated_code;
 use crate::{ir::types, ir::AtomicRmwOp, isa};
-use generated_code::{Context, MInst, RegisterClass};
+use generated_code::{AssemblerOutputs, Context, MInst, RegisterClass};
 
 // Types that the generated ISLE code uses via `use super::*`.
+use super::external::{isle_assembler_methods, CraneliftRegisters, PairedGpr, PairedXmm};
 use super::{is_int_or_ref_ty, is_mergeable_load, lower_to_amode, MergeableLoadSize};
-use crate::ir::LibCall;
+use crate::ir::condcodes::{FloatCC, IntCC};
+use crate::ir::immediates::*;
+use crate::ir::types::*;
+use crate::ir::{
+    BlockCall, Inst, InstructionData, LibCall, MemFlags, Opcode, TrapCode, Value, ValueList,
+};
+use crate::isa::x64::abi::X64CallSite;
+use crate::isa::x64::inst::{args::*, regs, ReturnCallInfo};
 use crate::isa::x64::lower::emit_vm_call;
 use crate::isa::x64::X64Backend;
-use crate::{
-    ir::{
-        condcodes::{FloatCC, IntCC},
-        immediates::*,
-        types::*,
-        BlockCall, Inst, InstructionData, MemFlags, Opcode, TrapCode, Value, ValueList,
-    },
-    isa::x64::{
-        abi::X64CallSite,
-        inst::{args::*, regs, ReturnCallInfo},
-    },
-    machinst::{
-        isle::*, ArgPair, CallInfo, InsnInput, InstOutput, IsTailCall, MachInst, VCodeConstant,
-        VCodeConstantData,
-    },
+use crate::machinst::isle::*;
+use crate::machinst::{
+    ArgPair, CallInfo, InsnInput, InstOutput, IsTailCall, MachInst, VCodeConstant,
+    VCodeConstantData,
 };
 use alloc::vec::Vec;
+use cranelift_assembler_x64 as asm;
 use regalloc2::PReg;
 use std::boxed::Box;
 
@@ -40,6 +38,10 @@ type BoxReturnCallInfo = Box<ReturnCallInfo<ExternalName>>;
 type BoxReturnCallIndInfo = Box<ReturnCallInfo<Reg>>;
 type VecArgPair = Vec<ArgPair>;
 type BoxSyntheticAmode = Box<SyntheticAmode>;
+
+/// When interacting with the external assembler (see `external.rs`), we
+/// need to fix the types we'll use.
+type AssemblerInst = asm::Inst<CraneliftRegisters>;
 
 pub struct SinkableLoad {
     inst: Inst,
@@ -74,6 +76,7 @@ pub(crate) fn lower_branch(
 impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     isle_lower_prelude_methods!();
     isle_prelude_caller_methods!(X64CallSite);
+    isle_assembler_methods!();
 
     #[inline]
     fn operand_size_of_type_32_64(&mut self, ty: Type) -> OperandSize {
@@ -944,6 +947,81 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     fn box_synthetic_amode(&mut self, amode: &SyntheticAmode) -> BoxSyntheticAmode {
         Box::new(amode.clone())
     }
+
+    ////////////////////////////////////////////////////////////////////////////
+    ///// External assembler methods.
+    ////////////////////////////////////////////////////////////////////////////
+
+    fn is_imm8(&mut self, src: &GprMemImm) -> Option<u8> {
+        match src.clone().to_reg_mem_imm() {
+            RegMemImm::Imm { simm32 } => Some(u8::try_from(simm32).ok()?),
+            _ => None,
+        }
+    }
+
+    fn is_simm8(&mut self, src: &GprMemImm) -> Option<i8> {
+        match src.clone().to_reg_mem_imm() {
+            RegMemImm::Imm { simm32 } => Some(i8::try_from(simm32).ok()?),
+            _ => None,
+        }
+    }
+
+    fn is_imm16(&mut self, src: &GprMemImm) -> Option<u16> {
+        match src.clone().to_reg_mem_imm() {
+            RegMemImm::Imm { simm32 } => Some(u16::try_from(simm32).ok()?),
+            _ => None,
+        }
+    }
+
+    fn is_simm16(&mut self, src: &GprMemImm) -> Option<i16> {
+        match src.clone().to_reg_mem_imm() {
+            RegMemImm::Imm { simm32 } => Some(i16::try_from(simm32).ok()?),
+            _ => None,
+        }
+    }
+
+    fn is_imm32(&mut self, src: &GprMemImm) -> Option<u32> {
+        match src.clone().to_reg_mem_imm() {
+            RegMemImm::Imm { simm32 } => Some(simm32),
+            _ => None,
+        }
+    }
+
+    fn is_simm32(&mut self, src: &GprMemImm) -> Option<i32> {
+        match src.clone().to_reg_mem_imm() {
+            RegMemImm::Imm { simm32 } => Some(simm32 as i32),
+            _ => None,
+        }
+    }
+
+    fn is_gpr(&mut self, src: &GprMemImm) -> Option<Gpr> {
+        match src.clone().to_reg_mem_imm() {
+            RegMemImm::Reg { reg } => Gpr::new(reg),
+            _ => None,
+        }
+    }
+
+    fn is_xmm(&mut self, src: &XmmMem) -> Option<Xmm> {
+        match src.clone().to_reg_mem() {
+            RegMem::Reg { reg } => Xmm::new(reg),
+            _ => None,
+        }
+    }
+
+    fn is_gpr_mem(&mut self, src: &GprMemImm) -> Option<GprMem> {
+        match src.clone().to_reg_mem_imm() {
+            RegMemImm::Reg { reg } => GprMem::new(RegMem::Reg { reg }),
+            RegMemImm::Mem { addr } => GprMem::new(RegMem::Mem { addr }),
+            _ => None,
+        }
+    }
+
+    fn is_xmm_mem(&mut self, src: &XmmMem) -> Option<XmmMem> {
+        match src.clone().to_reg_mem() {
+            RegMem::Reg { reg } => XmmMem::new(RegMem::Reg { reg }),
+            RegMem::Mem { addr } => XmmMem::new(RegMem::Mem { addr }),
+        }
+    }
 }
 
 impl IsleContext<'_, '_, MInst, X64Backend> {
@@ -955,6 +1033,54 @@ impl IsleContext<'_, '_, MInst, X64Backend> {
             dst: Writable::from_reg(Xmm::unwrap_new(tmp.to_reg())),
         });
         Xmm::unwrap_new(tmp.to_reg())
+    }
+
+    /// Helper used by code generated by the `cranelift-assembler-x64` crate.
+    fn convert_gpr_to_assembler_read_write_gpr(&mut self, read: Gpr) -> asm::Gpr<PairedGpr> {
+        let write = self.lower_ctx.alloc_tmp(types::I64).only_reg().unwrap();
+        let write = WritableGpr::from_writable_reg(write).unwrap();
+        asm::Gpr::new(PairedGpr { read, write })
+    }
+
+    /// Helper used by code generated by the `cranelift-assembler-x64` crate.
+    fn convert_xmm_to_assembler_read_write_xmm(&mut self, read: Xmm) -> asm::Xmm<PairedXmm> {
+        let write = self.lower_ctx.alloc_tmp(types::F32X4).only_reg().unwrap();
+        let write = WritableXmm::from_writable_reg(write).unwrap();
+        asm::Xmm::new(PairedXmm { read, write })
+    }
+
+    /// Helper used by code generated by the `cranelift-assembler-x64` crate.
+    fn convert_gpr_mem_to_assembler_read_gpr_mem(&self, read: &GprMem) -> asm::GprMem<Gpr, Gpr> {
+        match read.clone().into() {
+            RegMem::Reg { reg } => asm::GprMem::Gpr(Gpr::new(reg).unwrap()),
+            RegMem::Mem { addr } => asm::GprMem::Mem(addr.into()),
+        }
+    }
+
+    /// Helper used by code generated by the `cranelift-assembler-x64` crate.
+    fn convert_xmm_mem_to_assembler_read_xmm_mem(
+        &self,
+        read: &XmmMemAligned,
+    ) -> asm::XmmMem<Xmm, Gpr> {
+        match read.clone().into() {
+            RegMem::Reg { reg } => asm::XmmMem::Xmm(Xmm::new(reg).unwrap()),
+            RegMem::Mem { addr } => asm::XmmMem::Mem(addr.into()),
+        }
+    }
+
+    /// Helper used by code generated by the `cranelift-assembler-x64` crate.
+    fn convert_gpr_mem_to_assembler_read_write_gpr_mem(
+        &mut self,
+        read: &GprMem,
+    ) -> asm::GprMem<PairedGpr, Gpr> {
+        match read.clone().into() {
+            RegMem::Reg { reg } => asm::GprMem::Gpr(
+                *self
+                    .convert_gpr_to_assembler_read_write_gpr(Gpr::new(reg).unwrap())
+                    .as_ref(),
+            ),
+            RegMem::Mem { addr } => asm::GprMem::Mem(addr.into()),
+        }
     }
 }
 

@@ -6,9 +6,9 @@ use crate::{
         sockets::udp,
     },
     udp::{IncomingDatagramStream, OutgoingDatagramStream, SendState, UdpState},
-    Subscribe,
+    Pollable,
 };
-use crate::{Pollable, SocketError, SocketResult, WasiImpl, WasiView};
+use crate::{IoView, SocketError, SocketResult, WasiImpl, WasiView};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use io_lifetimes::AsSocketlike;
@@ -16,6 +16,7 @@ use rustix::io::Errno;
 use std::net::SocketAddr;
 use tokio::io::Interest;
 use wasmtime::component::Resource;
+use wasmtime_wasi_io::poll::DynPollable;
 
 /// Theoretical maximum byte size of a UDP datagram, the real limit is lower,
 /// but we do not account for e.g. the transport layer here for simplicity.
@@ -24,7 +25,6 @@ const MAX_UDP_DATAGRAM_SIZE: usize = u16::MAX as usize;
 
 impl<T> udp::Host for WasiImpl<T> where T: WasiView {}
 
-#[async_trait::async_trait]
 impl<T> udp::HostUdpSocket for WasiImpl<T>
 where
     T: WasiView,
@@ -288,8 +288,11 @@ where
         Ok(())
     }
 
-    fn subscribe(&mut self, this: Resource<udp::UdpSocket>) -> anyhow::Result<Resource<Pollable>> {
-        crate::poll::subscribe(self.table(), this)
+    fn subscribe(
+        &mut self,
+        this: Resource<udp::UdpSocket>,
+    ) -> anyhow::Result<Resource<DynPollable>> {
+        wasmtime_wasi_io::poll::subscribe(self.table(), this)
     }
 
     fn drop(&mut self, this: Resource<udp::UdpSocket>) -> Result<(), anyhow::Error> {
@@ -371,8 +374,8 @@ where
     fn subscribe(
         &mut self,
         this: Resource<udp::IncomingDatagramStream>,
-    ) -> anyhow::Result<Resource<Pollable>> {
-        crate::poll::subscribe(self.table(), this)
+    ) -> anyhow::Result<Resource<DynPollable>> {
+        wasmtime_wasi_io::poll::subscribe(self.table(), this)
     }
 
     fn drop(&mut self, this: Resource<udp::IncomingDatagramStream>) -> Result<(), anyhow::Error> {
@@ -388,7 +391,7 @@ where
 }
 
 #[async_trait]
-impl Subscribe for IncomingDatagramStream {
+impl Pollable for IncomingDatagramStream {
     async fn ready(&mut self) {
         // FIXME: Add `Interest::ERROR` when we update to tokio 1.32.
         self.inner
@@ -398,7 +401,6 @@ impl Subscribe for IncomingDatagramStream {
     }
 }
 
-#[async_trait::async_trait]
 impl<T> udp::HostOutgoingDatagramStream for WasiImpl<T>
 where
     T: WasiView,
@@ -511,8 +513,8 @@ where
     fn subscribe(
         &mut self,
         this: Resource<udp::OutgoingDatagramStream>,
-    ) -> anyhow::Result<Resource<Pollable>> {
-        crate::poll::subscribe(self.table(), this)
+    ) -> anyhow::Result<Resource<DynPollable>> {
+        wasmtime_wasi_io::poll::subscribe(self.table(), this)
     }
 
     fn drop(&mut self, this: Resource<udp::OutgoingDatagramStream>) -> Result<(), anyhow::Error> {
@@ -528,7 +530,7 @@ where
 }
 
 #[async_trait]
-impl Subscribe for OutgoingDatagramStream {
+impl Pollable for OutgoingDatagramStream {
     async fn ready(&mut self) {
         match self.send_state {
             SendState::Idle | SendState::Permitted(_) => {}

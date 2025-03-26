@@ -558,11 +558,11 @@ impl ABIMachineSpec for Riscv64MachineDeps {
     fn gen_call(dest: &CallDest, tmp: Writable<Reg>, info: CallInfo<()>) -> SmallVec<[Self::I; 2]> {
         let mut insts = SmallVec::new();
         match &dest {
-            &CallDest::ExtName(ref name, RelocDistance::Near) => {
+            CallDest::ExtName(name, RelocDistance::Near) => {
                 let info = Box::new(info.map(|()| name.clone()));
                 insts.push(Inst::Call { info })
             }
-            &CallDest::ExtName(ref name, RelocDistance::Far) => {
+            CallDest::ExtName(name, RelocDistance::Far) => {
                 insts.push(Inst::LoadExtName {
                     rd: tmp,
                     name: Box::new(name.clone()),
@@ -571,7 +571,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
                 let info = Box::new(info.map(|()| tmp.to_reg()));
                 insts.push(Inst::CallInd { info });
             }
-            &CallDest::Reg(reg) => {
+            CallDest::Reg(reg) => {
                 let info = Box::new(info.map(|()| *reg));
                 insts.push(Inst::CallInd { info });
             }
@@ -634,7 +634,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
 
     fn get_machine_env(_flags: &settings::Flags, _call_conv: isa::CallConv) -> &MachineEnv {
         static MACHINE_ENV: OnceLock<MachineEnv> = OnceLock::new();
-        MACHINE_ENV.get_or_init(create_reg_enviroment)
+        MACHINE_ENV.get_or_init(create_reg_environment)
     }
 
     fn get_regs_clobbered_by_call(_call_conv_of_callee: isa::CallConv) -> PRegSet {
@@ -697,8 +697,14 @@ impl ABIMachineSpec for Riscv64MachineDeps {
     ) {
         // Unroll at most n consecutive probes, before falling back to using a loop
         const PROBE_MAX_UNROLL: u32 = 3;
-        // Number of probes that we need to perform
-        let probe_count = align_to(frame_size, guard_size) / guard_size;
+
+        // Calculate how many probes we need to perform. Round down, as we only
+        // need to probe whole guard_size regions we'd otherwise skip over.
+        let probe_count = frame_size / guard_size;
+        if probe_count == 0 {
+            // No probe necessary
+            return;
+        }
 
         // Must be a caller-saved register that is not an argument.
         let tmp = Writable::from_reg(x_reg(28)); // t3
@@ -888,7 +894,7 @@ const DEFAULT_CLOBBERS: PRegSet = PRegSet::empty()
     .with(pv_reg(30))
     .with(pv_reg(31));
 
-fn create_reg_enviroment() -> MachineEnv {
+fn create_reg_environment() -> MachineEnv {
     // Some C Extension instructions can only use a subset of the registers.
     // x8 - x15, f8 - f15, v8 - v15 so we should prefer to use those since
     // they allow us to emit C instructions more often.

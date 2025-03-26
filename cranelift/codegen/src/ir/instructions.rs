@@ -307,9 +307,7 @@ impl InstructionData {
     /// `br_table` returns the empty slice.
     pub fn branch_destination<'a>(&'a self, jump_tables: &'a ir::JumpTables) -> &'a [BlockCall] {
         match self {
-            Self::Jump {
-                ref destination, ..
-            } => std::slice::from_ref(destination),
+            Self::Jump { destination, .. } => std::slice::from_ref(destination),
             Self::Brif { blocks, .. } => blocks.as_slice(),
             Self::BranchTable { table, .. } => jump_tables.get(*table).unwrap().all_branches(),
             _ => {
@@ -327,10 +325,7 @@ impl InstructionData {
         jump_tables: &'a mut ir::JumpTables,
     ) -> &'a mut [BlockCall] {
         match self {
-            Self::Jump {
-                ref mut destination,
-                ..
-            } => std::slice::from_mut(destination),
+            Self::Jump { destination, .. } => std::slice::from_mut(destination),
             Self::Brif { blocks, .. } => blocks.as_mut_slice(),
             Self::BranchTable { table, .. } => {
                 jump_tables.get_mut(*table).unwrap().all_branches_mut()
@@ -812,7 +807,7 @@ impl OperandConstraint {
                     // control type to construct the interval of [F16, ctrl_type).
                     tys.floats = BitSet8::from_range(4, ctrl_type_bits as u8);
                 } else {
-                    panic!("The Narrower constraint only operates on floats or ints");
+                    panic!("The Narrower constraint only operates on floats or ints, got {ctrl_type:?}");
                 }
                 ResolvedConstraint::Free(tys)
             }
@@ -843,7 +838,9 @@ impl OperandConstraint {
                         tys.floats = BitSet8::from_range(lower_bound, 8);
                     }
                 } else {
-                    panic!("The Wider constraint only operates on floats or ints");
+                    panic!(
+                        "The Wider constraint only operates on floats or ints, got {ctrl_type:?}"
+                    );
                 }
 
                 ResolvedConstraint::Free(tys)

@@ -16,7 +16,16 @@ pub fn build(
     config: &mut Config,
 ) -> arbitrary::Result<Option<Box<dyn DiffEngine>>> {
     let engine: Box<dyn DiffEngine> = match name {
-        "wasmtime" => Box::new(WasmtimeEngine::new(u, config, CompilerStrategy::Cranelift)?),
+        "wasmtime" => Box::new(WasmtimeEngine::new(
+            u,
+            config,
+            CompilerStrategy::CraneliftNative,
+        )?),
+        "pulley" => Box::new(WasmtimeEngine::new(
+            u,
+            config,
+            CompilerStrategy::CraneliftPulley,
+        )?),
         "wasmi" => Box::new(WasmiEngine::new(config)),
 
         #[cfg(target_arch = "x86_64")]
@@ -50,11 +59,14 @@ pub trait DiffEngine {
 
     /// Tests that the wasmtime-originating `trap` matches the error this engine
     /// generated.
-    fn assert_error_match(&self, trap: &Trap, err: &Error);
+    fn assert_error_match(&self, err: &Error, trap: &Trap);
 
-    /// Returns whether the error specified from this engine might be stack
-    /// overflow.
-    fn is_stack_overflow(&self, err: &Error) -> bool;
+    /// Returns whether the error specified from this engine is
+    /// non-deterministic, like a stack overflow or an attempt to allocate an
+    /// object that is too large (which is non-deterministic because it may
+    /// depend on which collector it was configured with or memory available on
+    /// the system).
+    fn is_non_deterministic_error(&self, err: &Error) -> bool;
 }
 
 /// Provide a way to evaluate Wasm functions--a Wasm instance implemented by a

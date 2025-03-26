@@ -11,7 +11,7 @@
 //! pointer (FP) and program counter (PC) each time we call into Wasm and Wasm
 //! calls into the host via trampolines (see
 //! `crates/wasmtime/src/runtime/vm/trampolines`). The most recent entry is
-//! stored in `VMRuntimeLimits` and older entries are saved in
+//! stored in `VMStoreContext` and older entries are saved in
 //! `CallThreadState`. This lets us identify ranges of contiguous Wasm frames on
 //! the stack.
 //!
@@ -22,10 +22,10 @@
 //! frame is a host frame).
 
 use crate::prelude::*;
-use crate::runtime::vm::arch;
+use crate::runtime::store::StoreOpaque;
 use crate::runtime::vm::{
     traphandlers::{tls, CallThreadState},
-    VMRuntimeLimits,
+    Unwind, VMStoreContext,
 };
 use core::ops::ControlFlow;
 
@@ -37,6 +37,10 @@ pub struct Backtrace(Vec<Frame>);
 #[derive(Debug)]
 pub struct Frame {
     pc: usize,
+    #[cfg_attr(
+        not(feature = "gc"),
+        expect(dead_code, reason = "not worth #[cfg] annotations to remove")
+    )]
     fp: usize,
 }
 
@@ -47,6 +51,7 @@ impl Frame {
     }
 
     /// Get this frame's frame pointer.
+    #[cfg(feature = "gc")]
     pub fn fp(&self) -> usize {
         self.fp
     }
@@ -59,9 +64,13 @@ impl Backtrace {
     }
 
     /// Capture the current Wasm stack in a backtrace.
-    pub fn new(limits: *const VMRuntimeLimits) -> Backtrace {
+    pub fn new(store: &StoreOpaque) -> Backtrace {
+        let vm_store_context = store.vm_store_context();
+        let unwind = store.unwinder();
         tls::with(|state| match state {
-            Some(state) => unsafe { Self::new_with_trap_state(limits, state, None) },
+            Some(state) => unsafe {
+                Self::new_with_trap_state(vm_store_context, unwind, state, None)
+            },
             None => Backtrace(vec![]),
         })
     }
@@ -70,14 +79,15 @@ impl Backtrace {
     ///
     /// If Wasm hit a trap, and we calling this from the trap handler, then the
     /// Wasm exit trampoline didn't run, and we use the provided PC and FP
-    /// instead of looking them up in `VMRuntimeLimits`.
+    /// instead of looking them up in `VMStoreContext`.
     pub(crate) unsafe fn new_with_trap_state(
-        limits: *const VMRuntimeLimits,
+        vm_store_context: *const VMStoreContext,
+        unwind: &dyn Unwind,
         state: &CallThreadState,
         trap_pc_and_fp: Option<(usize, usize)>,
     ) -> Backtrace {
         let mut frames = vec![];
-        Self::trace_with_trap_state(limits, state, trap_pc_and_fp, |frame| {
+        Self::trace_with_trap_state(vm_store_context, unwind, state, trap_pc_and_fp, |frame| {
             frames.push(frame);
             ControlFlow::Continue(())
         });
@@ -85,9 +95,14 @@ impl Backtrace {
     }
 
     /// Walk the current Wasm stack, calling `f` for each frame we walk.
-    pub fn trace(limits: *const VMRuntimeLimits, f: impl FnMut(Frame) -> ControlFlow<()>) {
+    #[cfg(feature = "gc")]
+    pub fn trace(store: &StoreOpaque, f: impl FnMut(Frame) -> ControlFlow<()>) {
+        let vm_store_context = store.vm_store_context();
+        let unwind = store.unwinder();
         tls::with(|state| match state {
-            Some(state) => unsafe { Self::trace_with_trap_state(limits, state, None, f) },
+            Some(state) => unsafe {
+                Self::trace_with_trap_state(vm_store_context, unwind, state, None, f)
+            },
             None => {}
         });
     }
@@ -96,9 +111,10 @@ impl Backtrace {
     ///
     /// If Wasm hit a trap, and we calling this from the trap handler, then the
     /// Wasm exit trampoline didn't run, and we use the provided PC and FP
-    /// instead of looking them up in `VMRuntimeLimits`.
+    /// instead of looking them up in `VMStoreContext`.
     pub(crate) unsafe fn trace_with_trap_state(
-        limits: *const VMRuntimeLimits,
+        vm_store_context: *const VMStoreContext,
+        unwind: &dyn Unwind,
         state: &CallThreadState,
         trap_pc_and_fp: Option<(usize, usize)>,
         mut f: impl FnMut(Frame) -> ControlFlow<()>,
@@ -110,14 +126,17 @@ impl Backtrace {
             // trampoline did not get a chance to save the last Wasm PC and FP,
             // and we need to use the plumbed-through values instead.
             Some((pc, fp)) => {
-                assert!(core::ptr::eq(limits, state.limits));
+                assert!(core::ptr::eq(
+                    vm_store_context,
+                    state.vm_store_context.as_ptr()
+                ));
                 (pc, fp)
             }
             // Either there is no Wasm currently on the stack, or we exited Wasm
             // through the Wasm-to-host trampoline.
             None => {
-                let pc = *(*limits).last_wasm_exit_pc.get();
-                let fp = *(*limits).last_wasm_exit_fp.get();
+                let pc = *(*vm_store_context).last_wasm_exit_pc.get();
+                let fp = *(*vm_store_context).last_wasm_exit_fp.get();
                 (pc, fp)
             }
         };
@@ -125,12 +144,12 @@ impl Backtrace {
         let activations = core::iter::once((
             last_wasm_exit_pc,
             last_wasm_exit_fp,
-            *(*limits).last_wasm_entry_fp.get(),
+            *(*vm_store_context).last_wasm_entry_fp.get(),
         ))
         .chain(
             state
                 .iter()
-                .filter(|state| core::ptr::eq(limits, state.limits))
+                .filter(|state| core::ptr::eq(vm_store_context, state.vm_store_context.as_ptr()))
                 .map(|state| {
                     (
                         state.old_last_wasm_exit_pc(),
@@ -148,7 +167,7 @@ impl Backtrace {
         });
 
         for (pc, fp, sp) in activations {
-            if let ControlFlow::Break(()) = Self::trace_through_wasm(pc, fp, sp, &mut f) {
+            if let ControlFlow::Break(()) = Self::trace_through_wasm(unwind, pc, fp, sp, &mut f) {
                 log::trace!("====== Done Capturing Backtrace (closure break) ======");
                 return;
             }
@@ -160,6 +179,7 @@ impl Backtrace {
     /// Walk through a contiguous sequence of Wasm frames starting with the
     /// frame at the given PC and FP and ending at `trampoline_sp`.
     unsafe fn trace_through_wasm(
+        unwind: &dyn Unwind,
         mut pc: usize,
         mut fp: usize,
         trampoline_fp: usize,
@@ -228,7 +248,7 @@ impl Backtrace {
             // Wasm. Finally also assert that it's aligned correctly as an
             // additional sanity check.
             assert!(trampoline_fp > fp, "{trampoline_fp:#x} > {fp:#x}");
-            arch::assert_fp_is_aligned(fp);
+            unwind.assert_fp_is_aligned(fp);
 
             log::trace!("--- Tracing through one Wasm frame ---");
             log::trace!("pc = {:p}", pc as *const ());
@@ -236,17 +256,17 @@ impl Backtrace {
 
             f(Frame { pc, fp })?;
 
-            pc = arch::get_next_older_pc_from_fp(fp);
+            pc = unwind.get_next_older_pc_from_fp(fp);
 
             // We rely on this offset being zero for all supported architectures
             // in `crates/cranelift/src/component/compiler.rs` when we set the
             // Wasm exit FP. If this ever changes, we will need to update that
             // code as well!
-            assert_eq!(arch::NEXT_OLDER_FP_FROM_FP_OFFSET, 0);
+            assert_eq!(unwind.next_older_fp_from_fp_offset(), 0);
 
             // Get the next older frame pointer from the current Wasm frame
             // pointer.
-            let next_older_fp = *(fp as *mut usize).add(arch::NEXT_OLDER_FP_FROM_FP_OFFSET);
+            let next_older_fp = *(fp as *mut usize).add(unwind.next_older_fp_from_fp_offset());
 
             // Because the stack always grows down, the older FP must be greater
             // than the current FP.

@@ -1,9 +1,17 @@
-use crate::debug::Reader;
+use crate::{debug::Reader, translate::get_vmctx_value_label};
 use core::fmt;
+use cranelift_codegen::{ir::ValueLabel, isa::TargetIsa, LabelValueLoc, ValueLabelsRanges};
 use gimli::{
-    write, AttributeValue, DebuggingInformationEntry, Dwarf, LittleEndian, Unit, UnitSectionOffset,
+    write, AttributeValue, DebuggingInformationEntry, Dwarf, LittleEndian, Unit, UnitOffset,
+    UnitSectionOffset,
 };
 
+macro_rules! dbi_log_enabled {
+    () => {
+        cfg!(any(feature = "trace-log", debug_assertions))
+            && ::log::log_enabled!(target: "debug-info-transform", ::log::Level::Trace)
+    };
+}
 macro_rules! dbi_log {
     ($($tt:tt)*) => {
         if cfg!(any(feature = "trace-log", debug_assertions)) {
@@ -12,6 +20,7 @@ macro_rules! dbi_log {
     };
 }
 pub(crate) use dbi_log;
+pub(crate) use dbi_log_enabled;
 
 pub struct CompileUnitSummary<'a> {
     unit: &'a Unit<Reader<'a>, usize>,
@@ -39,6 +48,26 @@ pub fn log_get_cu_summary<'a>(unit: &'a Unit<Reader<'a>, usize>) -> CompileUnitS
     CompileUnitSummary { unit }
 }
 
+pub struct DieRefSummary<'a> {
+    unit: &'a Unit<Reader<'a>, usize>,
+    unit_ref: UnitOffset,
+}
+
+impl<'a> fmt::Debug for DieRefSummary<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let section_offs = self.unit_ref.to_unit_section_offset(self.unit);
+        let offs = get_offset_value(section_offs);
+        write!(f, "0x{offs:08x}")
+    }
+}
+
+pub fn log_get_die_ref<'a>(
+    unit: &'a Unit<Reader<'a>, usize>,
+    unit_ref: UnitOffset,
+) -> DieRefSummary<'a> {
+    DieRefSummary { unit, unit_ref }
+}
+
 struct DieDetailedSummary<'a> {
     dwarf: &'a Dwarf<Reader<'a>>,
     unit: &'a Unit<Reader<'a>, usize>,
@@ -52,8 +81,8 @@ pub fn log_begin_input_die(
     depth: isize,
 ) {
     dbi_log!(
-        "=== Begin DIE at 0x{:08x} (depth = {}):\n{:?}",
-        get_offset_value(die.offset().to_unit_section_offset(unit)),
+        "=== Begin DIE at {:?} (depth = {}):\n{:?}",
+        log_get_die_ref(unit, die.offset()),
         depth,
         DieDetailedSummary { dwarf, unit, die }
     );
@@ -123,7 +152,10 @@ impl<'a> fmt::Debug for DieDetailedSummary<'a> {
                 AttributeValue::CallingConvention(value) => write!(f, "{value}"),
                 AttributeValue::Inline(value) => write!(f, "{value}"),
                 AttributeValue::Ordering(value) => write!(f, "{value}"),
-                AttributeValue::UnitRef(offset) => write!(f, "0x{:08x}", offset.0),
+                AttributeValue::UnitRef(offset) => {
+                    let section_offset = offset.to_unit_section_offset(unit);
+                    write!(f, "0x{:08x}", get_offset_value(section_offset))
+                }
                 AttributeValue::DebugInfoRef(offset) => write!(f, "0x{:08x}", offset.0),
                 unexpected_attr => write!(f, "<unexpected attr: {unexpected_attr:?}>"),
             }?;
@@ -219,8 +251,8 @@ pub fn log_end_output_die(
     depth: isize,
 ) {
     dbi_log!(
-        "=== End DIE at 0x{:08x} (depth = {}):\n{:?}",
-        get_offset_value(input_die.offset().to_unit_section_offset(input_unit)),
+        "=== End DIE at {:?} (depth = {}):\n{:?}",
+        log_get_die_ref(input_unit, input_die.offset()),
         depth,
         OutDieDetailedSummary {
             die_id,
@@ -237,8 +269,8 @@ pub fn log_end_output_die_skipped(
     depth: isize,
 ) {
     dbi_log!(
-        "=== End DIE at 0x{:08x} (depth = {}):\n  Skipped as {}\n",
-        get_offset_value(input_die.offset().to_unit_section_offset(input_unit)),
+        "=== End DIE at {:?} (depth = {}):\n  Skipped as {}\n",
+        log_get_die_ref(input_unit, input_die.offset()),
         depth,
         reason
     );
@@ -248,5 +280,81 @@ fn get_offset_value(offset: UnitSectionOffset) -> usize {
     match offset {
         UnitSectionOffset::DebugInfoOffset(offs) => offs.0,
         UnitSectionOffset::DebugTypesOffset(offs) => offs.0,
+    }
+}
+
+pub fn log_get_value_name(value: ValueLabel) -> ValueNameSummary {
+    ValueNameSummary { value }
+}
+
+pub struct ValueNameSummary {
+    value: ValueLabel,
+}
+
+impl fmt::Debug for ValueNameSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.value == get_vmctx_value_label() {
+            f.pad("VMCTX")
+        } else {
+            f.pad(&format!("L#{}", self.value.as_u32()))
+        }
+    }
+}
+
+pub fn log_get_value_loc(loc: LabelValueLoc, isa: &dyn TargetIsa) -> ValueLocSummary {
+    ValueLocSummary { loc, isa }
+}
+
+pub struct ValueLocSummary<'a> {
+    loc: LabelValueLoc,
+    isa: &'a dyn TargetIsa,
+}
+
+impl<'a> fmt::Debug for ValueLocSummary<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let LabelValueLoc::Reg(reg) = self.loc {
+            let reg_name = self.isa.pretty_print_reg(reg, self.isa.pointer_bytes());
+            return write!(f, "{reg_name}");
+        }
+
+        write!(f, "{:?}", self.loc)
+    }
+}
+
+pub fn log_get_value_ranges<'a>(
+    ranges: Option<&'a ValueLabelsRanges>,
+    isa: &'a dyn TargetIsa,
+) -> ValueRangesSummary<'a> {
+    ValueRangesSummary { ranges, isa }
+}
+
+pub struct ValueRangesSummary<'a> {
+    ranges: Option<&'a ValueLabelsRanges>,
+    isa: &'a dyn TargetIsa,
+}
+
+impl<'a> fmt::Debug for ValueRangesSummary<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(ranges) = self.ranges {
+            // Sort the output first for nicer display.
+            let mut locals = Vec::new();
+            for value in ranges {
+                locals.push(*value.0);
+            }
+            locals.sort_by_key(|n| n.as_u32());
+
+            for i in 0..locals.len() {
+                let name = locals[i];
+                write!(f, "{:<6?}:", log_get_value_name(name))?;
+                for range in ranges.get(&name).unwrap() {
+                    write!(f, " {:?}", log_get_value_loc(range.loc, self.isa))?;
+                    write!(f, "@[{}..{})", range.start, range.end)?;
+                }
+                if i != locals.len() - 1 {
+                    writeln!(f)?;
+                }
+            }
+        }
+        Ok(())
     }
 }

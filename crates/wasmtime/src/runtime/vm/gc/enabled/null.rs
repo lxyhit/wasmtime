@@ -8,15 +8,16 @@ use super::*;
 use crate::{
     prelude::*,
     vm::{
-        ExternRefHostDataId, ExternRefHostDataTable, GarbageCollection, GcHeap, GcHeapObject,
-        GcProgress, GcRootsIter, Mmap, SendSyncUnsafeCell, TypedGcRef, VMGcHeader, VMGcRef,
+        mmap::AlignedLength, ExternRefHostDataId, ExternRefHostDataTable, GarbageCollection,
+        GcHeap, GcHeapObject, GcProgress, GcRootsIter, GcRuntime, Mmap, SendSyncUnsafeCell,
+        TypedGcRef, VMGcHeader, VMGcRef,
     },
-    GcHeapOutOfMemory,
+    Engine, GcHeapOutOfMemory,
 };
+use core::ptr::NonNull;
 use core::{
     alloc::Layout,
     any::Any,
-    cell::UnsafeCell,
     num::{NonZeroU32, NonZeroUsize},
 };
 use wasmtime_environ::{
@@ -35,7 +36,7 @@ unsafe impl GcRuntime for NullCollector {
         &self.layouts
     }
 
-    fn new_gc_heap(&self) -> Result<Box<dyn GcHeap>> {
+    fn new_gc_heap(&self, _: &Engine) -> Result<Box<dyn GcHeap>> {
         let heap = NullHeap::new()?;
         Ok(Box::new(heap) as _)
     }
@@ -54,7 +55,7 @@ struct NullHeap {
     no_gc_count: usize,
 
     /// The actual GC heap.
-    heap: Mmap,
+    heap: Mmap<AlignedLength>,
 }
 
 /// The common header for all arrays in the null collector.
@@ -110,7 +111,7 @@ impl VMNullExternRef {
 }
 
 fn oom() -> Error {
-    GcHeapOutOfMemory::new(()).into_anyhow()
+    GcHeapOutOfMemory::new(()).into()
 }
 
 impl NullHeap {
@@ -143,7 +144,7 @@ impl NullHeap {
             }
         }) {
             Some(size) => size,
-            None => return Err(crate::Trap::AllocationTooLarge.into_anyhow()),
+            None => return Err(crate::Trap::AllocationTooLarge.into()),
         };
 
         let next = *self.next.get_mut();
@@ -200,8 +201,8 @@ unsafe impl GcHeap for NullHeap {
         self.no_gc_count -= 1;
     }
 
-    fn heap_slice(&self) -> &[UnsafeCell<u8>] {
-        let ptr = self.heap.as_ptr().cast();
+    fn heap_slice(&self) -> &[u8] {
+        let ptr = self.heap.as_ptr();
         let len = self.heap.len();
         unsafe { core::slice::from_raw_parts(ptr, len) }
     }
@@ -308,8 +309,8 @@ unsafe impl GcHeap for NullHeap {
         Box::new(NullCollection {})
     }
 
-    unsafe fn vmctx_gc_heap_data(&self) -> *mut u8 {
-        self.next.get().cast()
+    unsafe fn vmctx_gc_heap_data(&self) -> NonNull<u8> {
+        NonNull::new(self.next.get()).unwrap().cast()
     }
 
     #[cfg(feature = "pooling-allocator")]

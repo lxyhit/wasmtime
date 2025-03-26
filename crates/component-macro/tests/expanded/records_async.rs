@@ -192,7 +192,7 @@ pub mod foo {
         #[allow(clippy::all)]
         pub mod records {
             #[allow(unused_imports)]
-            use wasmtime::component::__internal::anyhow;
+            use wasmtime::component::__internal::{anyhow, Box};
             #[derive(wasmtime::component::ComponentType)]
             #[derive(wasmtime::component::Lift)]
             #[derive(wasmtime::component::Lower)]
@@ -321,6 +321,15 @@ pub mod foo {
                     4 == < Aggregates as wasmtime::component::ComponentType >::ALIGN32
                 );
             };
+            pub type TupleTypedef = (i32,);
+            const _: () = {
+                assert!(
+                    4 == < TupleTypedef as wasmtime::component::ComponentType >::SIZE32
+                );
+                assert!(
+                    4 == < TupleTypedef as wasmtime::component::ComponentType >::ALIGN32
+                );
+            };
             pub type IntTypedef = i32;
             const _: () = {
                 assert!(
@@ -339,7 +348,7 @@ pub mod foo {
                     4 == < TupleTypedef2 as wasmtime::component::ComponentType >::ALIGN32
                 );
             };
-            #[wasmtime::component::__internal::async_trait]
+            #[wasmtime::component::__internal::trait_variant_make(::core::marker::Send)]
             pub trait Host: Send {
                 async fn tuple_arg(&mut self, x: (char, u32)) -> ();
                 async fn tuple_result(&mut self) -> (char, u32);
@@ -355,19 +364,23 @@ pub mod foo {
             }
             pub trait GetHost<
                 T,
-            >: Fn(T) -> <Self as GetHost<T>>::Host + Send + Sync + Copy + 'static {
+                D,
+            >: Fn(T) -> <Self as GetHost<T, D>>::Host + Send + Sync + Copy + 'static {
                 type Host: Host + Send;
             }
-            impl<F, T, O> GetHost<T> for F
+            impl<F, T, D, O> GetHost<T, D> for F
             where
                 F: Fn(T) -> O + Send + Sync + Copy + 'static,
                 O: Host + Send,
             {
                 type Host = O;
             }
-            pub fn add_to_linker_get_host<T>(
+            pub fn add_to_linker_get_host<
+                T,
+                G: for<'a> GetHost<&'a mut T, T, Host: Host + Send>,
+            >(
                 linker: &mut wasmtime::component::Linker<T>,
-                host_getter: impl for<'a> GetHost<&'a mut T>,
+                host_getter: G,
             ) -> wasmtime::Result<()>
             where
                 T: Send,
@@ -513,7 +526,6 @@ pub mod foo {
             {
                 add_to_linker_get_host(linker, get)
             }
-            #[wasmtime::component::__internal::async_trait]
             impl<_T: Host + ?Sized + Send> Host for &mut _T {
                 async fn tuple_arg(&mut self, x: (char, u32)) -> () {
                     Host::tuple_arg(*self, x).await
@@ -558,7 +570,7 @@ pub mod exports {
             #[allow(clippy::all)]
             pub mod records {
                 #[allow(unused_imports)]
-                use wasmtime::component::__internal::anyhow;
+                use wasmtime::component::__internal::{anyhow, Box};
                 #[derive(wasmtime::component::ComponentType)]
                 #[derive(wasmtime::component::Lift)]
                 #[derive(wasmtime::component::Lower)]
@@ -708,6 +720,17 @@ pub mod exports {
                     );
                     assert!(
                         4 == < Aggregates as wasmtime::component::ComponentType
+                        >::ALIGN32
+                    );
+                };
+                pub type TupleTypedef = (i32,);
+                const _: () = {
+                    assert!(
+                        4 == < TupleTypedef as wasmtime::component::ComponentType
+                        >::SIZE32
+                    );
+                    assert!(
+                        4 == < TupleTypedef as wasmtime::component::ComponentType
                         >::ALIGN32
                     );
                 };

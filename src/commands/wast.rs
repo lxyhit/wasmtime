@@ -8,7 +8,7 @@ use wasmtime_cli_flags::CommonOptions;
 use wasmtime_wast::{SpectestConfig, WastContext};
 
 /// Runs a WebAssembly test script file
-#[derive(Parser, PartialEq)]
+#[derive(Parser)]
 pub struct WastCommand {
     #[command(flatten)]
     common: CommonOptions,
@@ -23,9 +23,17 @@ impl WastCommand {
     pub fn execute(mut self) -> Result<()> {
         self.common.init_logging()?;
 
-        let config = self.common.config(None, None)?;
-        let store = Store::new(&Engine::new(&config)?, ());
-        let mut wast_context = WastContext::new(store);
+        let mut config = self.common.config(None)?;
+        config.async_support(true);
+        let mut store = Store::new(&Engine::new(&config)?, ());
+        if let Some(fuel) = self.common.wasm.fuel {
+            store.set_fuel(fuel)?;
+        }
+        if let Some(true) = self.common.wasm.epoch_interruption {
+            store.epoch_deadline_trap();
+            store.set_epoch_deadline(1);
+        }
+        let mut wast_context = WastContext::new(store, wasmtime_wast::Async::Yes);
 
         wast_context
             .register_spectest(&SpectestConfig {

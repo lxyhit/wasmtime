@@ -1,7 +1,7 @@
 use crate::prelude::*;
 use crate::runtime::vm::{
-    ExportFunction, SendSyncPtr, StoreBox, VMArrayCallHostFuncContext, VMContext, VMFuncRef,
-    VMFunctionImport, VMOpaqueContext,
+    ExportFunction, InterpreterRef, SendSyncPtr, StoreBox, VMArrayCallHostFuncContext, VMContext,
+    VMFuncRef, VMFunctionImport, VMOpaqueContext,
 };
 use crate::runtime::Uninhabited;
 use crate::store::{AutoAssertNoGc, StoreData, StoreOpaque, Stored};
@@ -12,11 +12,10 @@ use crate::{
 };
 use alloc::sync::Arc;
 use core::ffi::c_void;
-use core::future::Future;
 use core::mem::{self, MaybeUninit};
-use core::num::NonZeroUsize;
-use core::pin::Pin;
-use core::ptr::{self, NonNull};
+use core::ptr::NonNull;
+#[cfg(feature = "async")]
+use core::{future::Future, pin::Pin};
 use wasmtime_environ::VMSharedTypeIndex;
 
 /// A reference to the abstract `nofunc` heap value.
@@ -290,8 +289,7 @@ pub(crate) struct FuncData {
     ty: Option<Box<FuncType>>,
 }
 
-/// The three ways that a function can be created and referenced from within a
-/// store.
+/// The ways that a function can be created and referenced from within a store.
 enum FuncKind {
     /// A function already owned by the store via some other means. This is
     /// used, for example, when creating a `Func` from an instance's exported
@@ -563,8 +561,8 @@ impl Func {
                 .0
                 .async_cx()
                 .expect("Attempt to spawn new action on dying fiber");
-            let mut future = Pin::from(func(caller, params, results));
-            match unsafe { async_cx.block_on(future.as_mut()) } {
+            let future = func(caller, params, results);
+            match unsafe { async_cx.block_on(Pin::from(future)) } {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(trap)) | Err(trap) => Err(trap),
             }
@@ -573,12 +571,11 @@ impl Func {
 
     pub(crate) unsafe fn from_vm_func_ref(
         store: &mut StoreOpaque,
-        raw: *mut VMFuncRef,
-    ) -> Option<Func> {
-        let func_ref = NonNull::new(raw)?;
+        func_ref: NonNull<VMFuncRef>,
+    ) -> Func {
         debug_assert!(func_ref.as_ref().type_index != VMSharedTypeIndex::default());
         let export = ExportFunction { func_ref };
-        Some(Func::from_wasmtime_function(export, store))
+        Func::from_wasmtime_function(export, store)
     }
 
     /// Creates a new `Func` from the given Rust closure.
@@ -839,6 +836,7 @@ impl Func {
         }
     }
 
+    #[cfg(feature = "async")]
     fn wrap_inner<F, T, Params, Results>(mut store: impl AsContextMut<Data = T>, func: F) -> Func
     where
         F: Fn(Caller<'_, T>, Params) -> Results + Send + Sync + 'static,
@@ -882,9 +880,9 @@ impl Func {
                 .0
                 .async_cx()
                 .expect("Attempt to start async function on dying fiber");
-            let mut future = Pin::from(func(caller, args));
+            let future = func(caller, args);
 
-            match unsafe { async_cx.block_on(future.as_mut()) } {
+            match unsafe { async_cx.block_on(Pin::from(future)) } {
                 Ok(ret) => ret.into_fallible(),
                 Err(e) => R::fallible_from_error(e),
             }
@@ -1056,33 +1054,25 @@ impl Func {
     pub unsafe fn call_unchecked(
         &self,
         mut store: impl AsContextMut,
-        params_and_returns: *mut ValRaw,
-        params_and_returns_capacity: usize,
+        params_and_returns: *mut [ValRaw],
     ) -> Result<()> {
         let mut store = store.as_context_mut();
         let data = &store.0.store_data()[self.0];
         let func_ref = data.export().func_ref;
-        Self::call_unchecked_raw(
-            &mut store,
-            func_ref,
-            params_and_returns,
-            params_and_returns_capacity,
-        )
+        let params_and_returns = NonNull::new(params_and_returns).unwrap_or(NonNull::from(&mut []));
+        Self::call_unchecked_raw(&mut store, func_ref, params_and_returns)
     }
 
     pub(crate) unsafe fn call_unchecked_raw<T>(
         store: &mut StoreContextMut<'_, T>,
         func_ref: NonNull<VMFuncRef>,
-        params_and_returns: *mut ValRaw,
-        params_and_returns_capacity: usize,
+        params_and_returns: NonNull<[ValRaw]>,
     ) -> Result<()> {
-        invoke_wasm_and_catch_traps(store, |caller| {
-            let func_ref = func_ref.as_ref();
-            (func_ref.array_call)(
-                func_ref.vmctx,
-                caller.cast::<VMOpaqueContext>(),
+        invoke_wasm_and_catch_traps(store, |caller, vm| {
+            func_ref.as_ref().array_call(
+                vm,
+                VMOpaqueContext::from_vmcontext(caller),
                 params_and_returns,
-                params_and_returns_capacity,
             )
         })
     }
@@ -1102,7 +1092,7 @@ impl Func {
     }
 
     pub(crate) unsafe fn _from_raw(store: &mut StoreOpaque, raw: *mut c_void) -> Option<Func> {
-        Func::from_vm_func_ref(store, raw.cast())
+        Some(Func::from_vm_func_ref(store, NonNull::new(raw.cast())?))
     }
 
     /// Extracts the raw value of this `Func`, which is owned by `store`.
@@ -1219,7 +1209,7 @@ impl Func {
             // already. If it is at capacity (unlikely) then we need to do a GC
             // to free up space.
             let num_gc_refs = ty.as_wasm_func_type().non_i31_gc_ref_params_count();
-            if let Some(num_gc_refs) = NonZeroUsize::new(num_gc_refs) {
+            if let Some(num_gc_refs) = core::num::NonZeroUsize::new(num_gc_refs) {
                 return Ok(opaque
                     .gc_store()?
                     .gc_heap
@@ -1256,7 +1246,10 @@ impl Func {
         }
 
         unsafe {
-            self.call_unchecked(&mut *store, values_vec.as_mut_ptr(), values_vec_size)?;
+            self.call_unchecked(
+                &mut *store,
+                core::ptr::slice_from_raw_parts_mut(values_vec.as_mut_ptr(), values_vec_size),
+            )?;
         }
 
         for ((i, slot), val) in results.iter_mut().enumerate().zip(&values_vec) {
@@ -1327,18 +1320,18 @@ impl Func {
             };
             VMFunctionImport {
                 wasm_call: if let Some(wasm_call) = f.as_ref().wasm_call {
-                    wasm_call
+                    wasm_call.into()
                 } else {
                     // Assert that this is a array-call function, since those
                     // are the only ones that could be missing a `wasm_call`
                     // trampoline.
-                    let _ = VMArrayCallHostFuncContext::from_opaque(f.as_ref().vmctx);
+                    let _ = VMArrayCallHostFuncContext::from_opaque(f.as_ref().vmctx.as_non_null());
 
                     let sig = self.type_index(store.store_data());
                     module.wasm_to_array_trampoline(sig).expect(
                         "if the wasm is importing a function of a given type, it must have the \
                          type's trampoline",
-                    )
+                    ).into()
                 },
                 array_call: f.as_ref().array_call,
                 vmctx: f.as_ref().vmctx,
@@ -1586,7 +1579,7 @@ impl Func {
     /// multiple times and becomes multiple `wasmtime::Func`s, this hash key
     /// will be consistent across all of these functions.
     #[allow(dead_code)] // Not used yet, but added for consistency.
-    pub(crate) fn hash_key(&self, store: &mut StoreOpaque) -> impl core::hash::Hash + Eq {
+    pub(crate) fn hash_key(&self, store: &mut StoreOpaque) -> impl core::hash::Hash + Eq + use<> {
         self.vm_func_ref(store).as_ptr() as usize
     }
 }
@@ -1601,7 +1594,7 @@ impl Func {
 /// can pass to the called wasm function, if desired.
 pub(crate) fn invoke_wasm_and_catch_traps<T>(
     store: &mut StoreContextMut<'_, T>,
-    closure: impl FnMut(*mut VMContext),
+    closure: impl FnMut(NonNull<VMContext>, Option<InterpreterRef<'_>>) -> bool,
 ) -> Result<()> {
     unsafe {
         let exit = enter_wasm(store);
@@ -1610,14 +1603,7 @@ pub(crate) fn invoke_wasm_and_catch_traps<T>(
             exit_wasm(store, exit);
             return Err(trap);
         }
-        let result = crate::runtime::vm::catch_traps(
-            store.0.signal_handler(),
-            store.0.engine().config().wasm_backtrace,
-            store.0.engine().config().coredump_on_trap,
-            store.0.async_guard_range(),
-            store.0.default_caller(),
-            closure,
-        );
+        let result = crate::runtime::vm::catch_traps(store, closure);
         exit_wasm(store, exit);
         store.0.call_hook(CallHook::ReturningFromWasm)?;
         result.map_err(|t| crate::trap::from_runtime_box(store.0, t))
@@ -1646,7 +1632,7 @@ fn enter_wasm<T>(store: &mut StoreContextMut<'_, T>) -> Option<usize> {
     // For asynchronous stores then each call happens on a separate native
     // stack. This means that the previous stack limit is no longer relevant
     // because we're on a separate stack.
-    if unsafe { *store.0.runtime_limits().stack_limit.get() } != usize::MAX
+    if unsafe { *store.0.vm_store_context().stack_limit.get() } != usize::MAX
         && !store.0.async_support()
     {
         return None;
@@ -1659,7 +1645,19 @@ fn enter_wasm<T>(store: &mut StoreContextMut<'_, T>) -> Option<usize> {
         return None;
     }
 
+    // When Cranelift has support for the host then we might be running native
+    // compiled code meaning we need to read the actual stack pointer. If
+    // Cranelift can't be used though then we're guaranteed to be running pulley
+    // in which case this stack pointer isn't actually used as Pulley has custom
+    // mechanisms for stack overflow.
+    #[cfg(has_host_compiler_backend)]
     let stack_pointer = crate::runtime::vm::get_stack_pointer();
+    #[cfg(not(has_host_compiler_backend))]
+    let stack_pointer = {
+        use wasmtime_environ::TripleExt;
+        debug_assert!(store.engine().target().is_pulley());
+        usize::MAX
+    };
 
     // Determine the stack pointer where, after which, any wasm code will
     // immediately trap. This is checked on the entry to all wasm functions.
@@ -1678,7 +1676,7 @@ fn enter_wasm<T>(store: &mut StoreContextMut<'_, T>) -> Option<usize> {
     let wasm_stack_limit = stack_pointer - store.engine().config().max_wasm_stack;
     let prev_stack = unsafe {
         mem::replace(
-            &mut *store.0.runtime_limits().stack_limit.get(),
+            &mut *store.0.vm_store_context().stack_limit.get(),
             wasm_stack_limit,
         )
     };
@@ -1695,7 +1693,7 @@ fn exit_wasm<T>(store: &mut StoreContextMut<'_, T>, prev_stack: Option<usize>) {
     };
 
     unsafe {
-        *store.0.runtime_limits().stack_limit.get() = prev_stack;
+        *store.0.vm_store_context().stack_limit.get() = prev_stack;
     }
 }
 
@@ -1985,7 +1983,7 @@ pub unsafe trait WasmTyList {
 }
 
 macro_rules! impl_wasm_ty_list {
-    ($num:tt $($args:ident)*) => (paste::paste!{
+    ($num:tt $($args:ident)*) => (
         #[allow(non_snake_case)]
         unsafe impl<$($args),*> WasmTyList for ($($args,)*)
         where
@@ -2009,7 +2007,7 @@ macro_rules! impl_wasm_ty_list {
                 $( $args::may_gc() || )* false
             }
         }
-    });
+    );
 }
 
 for_each_function_signature!(impl_wasm_ty_list);
@@ -2040,7 +2038,7 @@ pub struct Caller<'a, T> {
 }
 
 impl<T> Caller<'_, T> {
-    unsafe fn with<F, R>(caller: *mut VMContext, f: F) -> R
+    unsafe fn with<F, R>(caller: NonNull<VMContext>, f: F) -> R
     where
         // The closure must be valid for any `Caller` it is given; it doesn't
         // get to choose the `Caller`'s lifetime.
@@ -2048,7 +2046,6 @@ impl<T> Caller<'_, T> {
         // And the return value must not borrow from the caller/store.
         R: 'static,
     {
-        debug_assert!(!caller.is_null());
         crate::runtime::vm::InstanceAndStore::from_vmctx(caller, |pair| {
             let (instance, mut store) = pair.unpack_context_mut::<T>();
 
@@ -2295,12 +2292,8 @@ impl HostContext {
 
         let ctx = unsafe {
             VMArrayCallHostFuncContext::new(
-                VMFuncRef {
-                    array_call,
-                    wasm_call: None,
-                    type_index,
-                    vmctx: ptr::null_mut(),
-                },
+                array_call,
+                type_index,
                 Box::new(HostFuncState {
                     func,
                     ty: ty.into_registered_type(),
@@ -2312,11 +2305,12 @@ impl HostContext {
     }
 
     unsafe extern "C" fn array_call_trampoline<T, F, P, R>(
-        callee_vmctx: *mut VMOpaqueContext,
-        caller_vmctx: *mut VMOpaqueContext,
-        args: *mut ValRaw,
+        callee_vmctx: NonNull<VMOpaqueContext>,
+        caller_vmctx: NonNull<VMOpaqueContext>,
+        args: NonNull<ValRaw>,
         args_len: usize,
-    ) where
+    ) -> bool
+    where
         F: Fn(Caller<'_, T>, P) -> R + 'static,
         P: WasmTyList,
         R: WasmRet,
@@ -2328,10 +2322,10 @@ impl HostContext {
         // should be part of this closure, and the long-jmp-ing
         // happens after the closure in handling the result.
         let run = move |mut caller: Caller<'_, T>| {
-            let args =
-                core::slice::from_raw_parts_mut(args.cast::<MaybeUninit<ValRaw>>(), args_len);
+            let mut args =
+                NonNull::slice_from_raw_parts(args.cast::<MaybeUninit<ValRaw>>(), args_len);
             let vmctx = VMArrayCallHostFuncContext::from_opaque(callee_vmctx);
-            let state = (*vmctx).host_state();
+            let state = vmctx.as_ref().host_state();
 
             // Double-check ourselves in debug mode, but we control
             // the `Any` here so an unsafe downcast should also
@@ -2350,7 +2344,7 @@ impl HostContext {
                 } else {
                     unsafe { AutoAssertNoGc::disabled(caller.store.0) }
                 };
-                let params = P::load(&mut store, args);
+                let params = P::load(&mut store, args.as_mut());
                 let _ = &mut store;
                 drop(store);
 
@@ -2369,22 +2363,17 @@ impl HostContext {
                 } else {
                     unsafe { AutoAssertNoGc::disabled(caller.store.0) }
                 };
-                let ret = ret.store(&mut store, args)?;
+                let ret = ret.store(&mut store, args.as_mut())?;
                 Ok(ret)
             }
         };
 
         // With nothing else on the stack move `run` into this
         // closure and then run it as part of `Caller::with`.
-        let result = crate::runtime::vm::catch_unwind_and_longjmp(move || {
+        crate::runtime::vm::catch_unwind_and_record_trap(move || {
             let caller_vmctx = VMContext::from_opaque(caller_vmctx);
             Caller::with(caller_vmctx, run)
-        });
-
-        match result {
-            Ok(val) => val,
-            Err(err) => crate::trap::raise(err),
-        }
+        })
     }
 }
 
@@ -2404,6 +2393,12 @@ pub(crate) struct HostFunc {
     // Stored to unregister this function's signature with the engine when this
     // is dropped.
     engine: Engine,
+}
+
+impl core::fmt::Debug for HostFunc {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HostFunc").finish_non_exhaustive()
+    }
 }
 
 impl HostFunc {
@@ -2453,6 +2448,7 @@ impl HostFunc {
     }
 
     /// Analog of [`Func::wrap_inner`]
+    #[cfg(any(feature = "component-model", feature = "async"))]
     pub fn wrap_inner<F, T, Params, Results>(engine: &Engine, func: F) -> Self
     where
         F: Fn(Caller<'_, T>, Params) -> Results + Send + Sync + 'static,
@@ -2556,7 +2552,7 @@ impl HostFunc {
 
     pub(crate) fn func_ref(&self) -> &VMFuncRef {
         match &self.ctx {
-            HostContext::Array(ctx) => unsafe { (*ctx.get()).func_ref() },
+            HostContext::Array(ctx) => unsafe { ctx.get().as_ref().func_ref() },
         }
     }
 

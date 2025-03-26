@@ -1,12 +1,13 @@
 use crate::prelude::*;
-use crate::runtime::vm::{CompiledModuleId, MmapVec, ModuleMemoryImages, VMWasmCallFunction};
+#[cfg(feature = "std")]
+use crate::runtime::vm::open_file_for_mmap;
+use crate::runtime::vm::{CompiledModuleId, ModuleMemoryImages, VMWasmCallFunction};
 use crate::sync::OnceLock;
 use crate::{
     code::CodeObject,
     code_memory::CodeMemory,
     instantiate::CompiledModule,
     resources::ResourcesRequired,
-    type_registry::TypeCollection,
     types::{ExportType, ExternType, ImportType},
     Engine,
 };
@@ -15,7 +16,7 @@ use core::fmt;
 use core::ops::Range;
 use core::ptr::NonNull;
 #[cfg(feature = "std")]
-use std::path::Path;
+use std::{fs::File, path::Path};
 use wasmparser::{Parser, ValidPayload, Validator};
 use wasmtime_environ::{
     CompiledModuleInfo, EntityIndex, HostPtr, ModuleTypes, ObjectKind, TypeTrace, VMOffsets,
@@ -23,9 +24,7 @@ use wasmtime_environ::{
 };
 mod registry;
 
-pub use registry::{
-    lookup_code, register_code, unregister_code, ModuleRegistry, RegisteredModuleId,
-};
+pub use registry::*;
 
 /// A compiled WebAssembly module, ready to be instantiated.
 ///
@@ -153,6 +152,7 @@ struct ModuleInner {
     memory_images: OnceLock<Option<ModuleMemoryImages>>,
 
     /// Flag indicating whether this module can be serialized or not.
+    #[cfg(any(feature = "cranelift", feature = "winch"))]
     serializable: bool,
 
     /// Runtime offset information for `VMContext`.
@@ -343,7 +343,8 @@ impl Module {
     /// state of the file.
     #[cfg(all(feature = "std", any(feature = "cranelift", feature = "winch")))]
     pub unsafe fn from_trusted_file(engine: &Engine, file: impl AsRef<Path>) -> Result<Module> {
-        let mmap = MmapVec::from_file(file.as_ref())?;
+        let open_file = open_file_for_mmap(file.as_ref())?;
+        let mmap = crate::runtime::vm::MmapVec::from_file(open_file)?;
         if &mmap[0..4] == b"\x7fELF" {
             let code = engine.load_code(mmap, ObjectKind::Module)?;
             return Module::from_parts(engine, code, None);
@@ -401,6 +402,24 @@ impl Module {
         Module::from_parts(engine, code, None)
     }
 
+    /// In-place deserialization of an in-memory compiled module previously
+    /// created with [`Module::serialize`] or [`Engine::precompile_module`].
+    ///
+    /// See [`Self::deserialize`] for additional information; this method
+    /// works identically except that it will not create a copy of the provided
+    /// memory but will use it directly.
+    ///
+    /// # Unsafety
+    ///
+    /// All of the safety notes from [`Self::deserialize`] apply here as well
+    /// with the additional constraint that the code memory provide by `memory`
+    /// lives for as long as the module and is nevery externally modified for
+    /// the lifetime of the deserialized module.
+    pub unsafe fn deserialize_raw(engine: &Engine, memory: NonNull<[u8]>) -> Result<Module> {
+        let code = engine.load_code_raw(memory, ObjectKind::Module)?;
+        Module::from_parts(engine, code, None)
+    }
+
     /// Same as [`deserialize`], except that the contents of `path` are read to
     /// deserialize into a [`Module`].
     ///
@@ -426,7 +445,35 @@ impl Module {
     /// state of the file.
     #[cfg(feature = "std")]
     pub unsafe fn deserialize_file(engine: &Engine, path: impl AsRef<Path>) -> Result<Module> {
-        let code = engine.load_code_file(path.as_ref(), ObjectKind::Module)?;
+        let file = open_file_for_mmap(path.as_ref())?;
+        Self::deserialize_open_file(engine, file)
+            .with_context(|| format!("failed deserialization for: {}", path.as_ref().display()))
+    }
+
+    /// Same as [`deserialize_file`], except that it takes an open `File`
+    /// instead of a path.
+    ///
+    /// This method is provided because it can be used instead of
+    /// [`deserialize_file`] in situations where `wasmtime` is running with
+    /// limited file system permissions. In that case a process
+    /// with file system access can pass already opened files to `wasmtime`.
+    ///
+    /// [`deserialize_file`]: Module::deserialize_file
+    ///
+    /// Note that the corresponding will be mapped as private writeable
+    /// (copy-on-write) and executable. For `windows` this means the file needs
+    /// to be opened with at least `FILE_GENERIC_READ | FILE_GENERIC_EXECUTE`
+    /// [`access_mode`].
+    ///
+    /// [`access_mode`]: https://doc.rust-lang.org/std/os/windows/fs/trait.OpenOptionsExt.html#tymethod.access_mode
+    ///
+    /// # Unsafety
+    ///
+    /// All of the reasons that [`deserialize_file`] is `unsafe` applies to this
+    /// function as well.
+    #[cfg(feature = "std")]
+    pub unsafe fn deserialize_open_file(engine: &Engine, file: File) -> Result<Module> {
+        let code = engine.load_code_file(file, ObjectKind::Module)?;
         Module::from_parts(engine, code, None)
     }
 
@@ -445,9 +492,9 @@ impl Module {
         // Acquire this module's metadata and type information, deserializing
         // it from the provided artifact if it wasn't otherwise provided
         // already.
-        let (info, types) = match info_and_types {
+        let (mut info, mut types) = match info_and_types {
             Some((info, types)) => (info, types),
-            None => postcard::from_bytes(code_memory.wasmtime_info()).err2anyhow()?,
+            None => postcard::from_bytes(code_memory.wasmtime_info())?,
         };
 
         // Register function type signatures into the engine for the lifetime
@@ -458,7 +505,8 @@ impl Module {
         // Note that the unsafety here should be ok since the `trampolines`
         // field should only point to valid trampoline function pointers
         // within the text section.
-        let signatures = TypeCollection::new_for_module(engine, &types);
+        let signatures =
+            engine.register_and_canonicalize_types(&mut types, core::iter::once(&mut info.module));
 
         // Package up all our data into a `CodeObject` and delegate to the final
         // step of module compilation.
@@ -481,12 +529,15 @@ impl Module {
             .allocator()
             .validate_module(module.module(), &offsets)?;
 
+        let _ = serializable;
+
         Ok(Self {
             inner: Arc::new(ModuleInner {
                 engine: engine.clone(),
                 code,
                 memory_images: OnceLock::new(),
                 module,
+                #[cfg(any(feature = "cranelift", feature = "winch"))]
                 serializable,
                 offsets,
             }),
@@ -517,8 +568,8 @@ impl Module {
 
         let mut functions = Vec::new();
         for payload in Parser::new(0).parse_all(binary) {
-            let payload = payload.err2anyhow()?;
-            if let ValidPayload::Func(a, b) = validator.payload(&payload).err2anyhow()? {
+            let payload = payload?;
+            if let ValidPayload::Func(a, b) = validator.payload(&payload)? {
                 functions.push((a, b));
             }
             if let wasmparser::Payload::Version { encoding, .. } = &payload {
@@ -528,15 +579,13 @@ impl Module {
             }
         }
 
-        engine
-            .run_maybe_parallel(functions, |(validator, body)| {
-                // FIXME: it would be best here to use a rayon-specific parallel
-                // iterator that maintains state-per-thread to share the function
-                // validator allocations (`Default::default` here) across multiple
-                // functions.
-                validator.into_validator(Default::default()).validate(&body)
-            })
-            .err2anyhow()?;
+        engine.run_maybe_parallel(functions, |(validator, body)| {
+            // FIXME: it would be best here to use a rayon-specific parallel
+            // iterator that maintains state-per-thread to share the function
+            // validator allocations (`Default::default` here) across multiple
+            // functions.
+            validator.into_validator(Default::default()).validate(&body)
+        })?;
         Ok(())
     }
 
@@ -590,7 +639,8 @@ impl Module {
         self.inner.code.module_types()
     }
 
-    pub(crate) fn signatures(&self) -> &TypeCollection {
+    #[cfg(any(feature = "component-model", feature = "gc-drc"))]
+    pub(crate) fn signatures(&self) -> &crate::type_registry::TypeCollection {
         self.inner.code.signatures()
     }
 
@@ -677,10 +727,8 @@ impl Module {
         let engine = self.engine();
         module
             .imports()
-            .map(move |(imp_mod, imp_field, mut ty)| {
-                ty.canonicalize_for_runtime_usage(&mut |i| {
-                    self.signatures().shared_type(i).unwrap()
-                });
+            .map(move |(imp_mod, imp_field, ty)| {
+                debug_assert!(ty.is_canonicalized_for_runtime_usage());
                 ImportType::new(imp_mod, imp_field, ty, types, engine)
             })
             .collect::<Vec<_>>()
@@ -1068,28 +1116,11 @@ impl Module {
     }
 
     /// Lookup the stack map at a program counter value.
-    pub(crate) fn lookup_stack_map(&self, pc: usize) -> Option<&wasmtime_environ::StackMap> {
-        let text_offset = pc - self.inner.module.text().as_ptr() as usize;
-        let (index, func_offset) = self.inner.module.func_by_text_offset(text_offset)?;
-        let info = self.inner.module.wasm_func_info(index);
-
-        // Do a binary search to find the stack map for the given offset.
-        let index = match info
-            .stack_maps
-            .binary_search_by_key(&func_offset, |i| i.code_offset)
-        {
-            // Found it.
-            Ok(i) => i,
-
-            // No stack map associated with this PC.
-            //
-            // Because we know we are in Wasm code, and we must be at some kind
-            // of call/safepoint, then the Cranelift backend must have avoided
-            // emitting a stack map for this location because no refs were live.
-            Err(_) => return None,
-        };
-
-        Some(&info.stack_maps[index].stack_map)
+    #[cfg(feature = "gc")]
+    pub(crate) fn lookup_stack_map(&self, pc: usize) -> Option<wasmtime_environ::StackMap<'_>> {
+        let text_offset = u32::try_from(pc - self.inner.module.text().as_ptr() as usize).unwrap();
+        let info = self.inner.code.code_memory().stack_map_data();
+        wasmtime_environ::StackMap::lookup(text_offset, info)
     }
 }
 
@@ -1134,7 +1165,7 @@ fn _assert_send_sync() {
 fn memory_images(engine: &Engine, module: &CompiledModule) -> Result<Option<ModuleMemoryImages>> {
     // If initialization via copy-on-write is explicitly disabled in
     // configuration then this path is skipped entirely.
-    if !engine.config().memory_init_cow {
+    if !engine.tunables().memory_init_cow {
         return Ok(None);
     }
 

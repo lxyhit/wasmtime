@@ -78,7 +78,7 @@ impl DiffEngine for V8Engine {
         }))
     }
 
-    fn assert_error_match(&self, wasmtime: &Trap, err: &Error) {
+    fn assert_error_match(&self, err: &Error, wasmtime: &Trap) {
         let v8 = err.to_string();
         let wasmtime_msg = wasmtime.to_string();
         let verify_wasmtime = |msg: &str| {
@@ -145,7 +145,7 @@ impl DiffEngine for V8Engine {
         verify_wasmtime("not possibly present in an error, just panic please");
     }
 
-    fn is_stack_overflow(&self, err: &Error) -> bool {
+    fn is_non_deterministic_error(&self, err: &Error) -> bool {
         err.to_string().contains("Maximum call stack size exceeded")
     }
 }

@@ -23,6 +23,7 @@ pub struct WastContext<T> {
     #[cfg(feature = "component-model")]
     component_linker: component::Linker<T>,
     store: Store<T>,
+    async_runtime: Option<tokio::runtime::Runtime>,
 }
 
 enum Outcome<T = Results> {
@@ -72,12 +73,26 @@ enum Export {
     Component(component::Func),
 }
 
+/// Whether or not to use async APIs when calling wasm during wast testing.
+///
+/// Passed to [`WastContext::new`].
+#[derive(Copy, Clone, PartialEq)]
+#[expect(missing_docs, reason = "self-describing variants")]
+pub enum Async {
+    Yes,
+    No,
+}
+
 impl<T> WastContext<T>
 where
     T: Clone + Send + 'static,
 {
     /// Construct a new instance of `WastContext`.
-    pub fn new(store: Store<T>) -> Self {
+    ///
+    /// Note that the provided `Store<T>` must have `Config::async_support`
+    /// enabled as all functions will be run with `call_async`. This is done to
+    /// support the component model async features that tests might use.
+    pub fn new(store: Store<T>, async_: Async) -> Self {
         // Spec tests will redefine the same module/name sometimes, so we need
         // to allow shadowing in the linker which picks the most recent
         // definition as what to link when linking.
@@ -94,6 +109,15 @@ where
             },
             store,
             modules: Default::default(),
+            async_runtime: if async_ == Async::Yes {
+                Some(
+                    tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap(),
+                )
+            } else {
+                None
+            },
         }
     }
 
@@ -124,12 +148,14 @@ where
     }
 
     fn instantiate_module(&mut self, module: &Module) -> Result<Outcome<Instance>> {
-        Ok(
-            match self.core_linker.instantiate(&mut self.store, &module) {
-                Ok(i) => Outcome::Ok(i),
-                Err(e) => Outcome::Trap(e),
-            },
-        )
+        let instance = match &self.async_runtime {
+            Some(rt) => rt.block_on(self.core_linker.instantiate_async(&mut self.store, &module)),
+            None => self.core_linker.instantiate(&mut self.store, &module),
+        };
+        Ok(match instance {
+            Ok(i) => Outcome::Ok(i),
+            Err(e) => Outcome::Trap(e),
+        })
     }
 
     #[cfg(feature = "component-model")]
@@ -137,15 +163,19 @@ where
         &mut self,
         component: &component::Component,
     ) -> Result<Outcome<(component::Component, component::Instance)>> {
-        Ok(
-            match self
+        let instance = match &self.async_runtime {
+            Some(rt) => rt.block_on(
+                self.component_linker
+                    .instantiate_async(&mut self.store, &component),
+            ),
+            None => self
                 .component_linker
-                .instantiate(&mut self.store, &component)
-            {
-                Ok(i) => Outcome::Ok((component.clone(), i)),
-                Err(e) => Outcome::Trap(e),
-            },
-        )
+                .instantiate(&mut self.store, &component),
+        };
+        Ok(match instance {
+            Ok(i) => Outcome::Ok((component.clone(), i)),
+            Err(e) => Outcome::Trap(e),
+        })
     }
 
     /// Register "spectest" which is used by the spec testsuite.
@@ -186,12 +216,19 @@ where
                     .iter()
                     .map(|v| match v {
                         WastArg::Core(v) => core::val(&mut self.store, v),
-                        WastArg::Component(_) => bail!("expected component function, found core"),
+                        _ => bail!("expected core function, found other other argument {v:?}"),
                     })
                     .collect::<Result<Vec<_>>>()?;
 
                 let mut results = vec![Val::null_func_ref(); func.ty(&self.store).results().len()];
-                Ok(match func.call(&mut self.store, &values, &mut results) {
+                let result = match &self.async_runtime {
+                    Some(rt) => {
+                        rt.block_on(func.call_async(&mut self.store, &values, &mut results))
+                    }
+                    None => func.call(&mut self.store, &values, &mut results),
+                };
+
+                Ok(match result {
                     Ok(()) => Outcome::Ok(Results::Core(results.into())),
                     Err(e) => Outcome::Trap(e),
                 })
@@ -203,15 +240,25 @@ where
                     .iter()
                     .map(|v| match v {
                         WastArg::Component(v) => component::val(v),
-                        WastArg::Core(_) => bail!("expected core function, found component"),
+                        _ => bail!("expected component function, found other argument {v:?}"),
                     })
                     .collect::<Result<Vec<_>>>()?;
 
                 let mut results =
                     vec![component::Val::Bool(false); func.results(&self.store).len()];
-                Ok(match func.call(&mut self.store, &values, &mut results) {
+                let result = match &self.async_runtime {
+                    Some(rt) => {
+                        rt.block_on(func.call_async(&mut self.store, &values, &mut results))
+                    }
+                    None => func.call(&mut self.store, &values, &mut results),
+                };
+                Ok(match result {
                     Ok(()) => {
-                        func.post_return(&mut self.store)?;
+                        match &self.async_runtime {
+                            Some(rt) => rt.block_on(func.post_return_async(&mut self.store))?,
+                            None => func.post_return(&mut self.store)?,
+                        }
+
                         Outcome::Ok(Results::Component(results.into()))
                     }
                     Err(e) => Outcome::Trap(e),
@@ -347,9 +394,7 @@ where
                 for (i, (v, e)) in values.iter().zip(results).enumerate() {
                     let e = match e {
                         WastRet::Core(core) => core,
-                        WastRet::Component(_) => {
-                            bail!("expected component value found core value")
-                        }
+                        _ => bail!("expected core value found other value {e:?}"),
                     };
                     core::match_val(&mut self.store, v, e)
                         .with_context(|| format!("result {i} didn't match"))?;
@@ -362,10 +407,8 @@ where
                 }
                 for (i, (v, e)) in values.iter().zip(results).enumerate() {
                     let e = match e {
-                        WastRet::Core(_) => {
-                            bail!("expected component value found core value")
-                        }
                         WastRet::Component(val) => val,
+                        _ => bail!("expected component value found other value {e:?}"),
                     };
                     component::match_val(e, v)
                         .with_context(|| format!("result {i} didn't match"))?;
@@ -527,7 +570,7 @@ where
                     Err(e) => e,
                 };
                 let error_message = format!("{err:?}");
-                if !is_matching_assert_invalid_error_message(&message, &error_message) {
+                if !is_matching_assert_invalid_error_message(filename, &message, &error_message) {
                     bail!(
                         "assert_invalid: expected \"{}\", got \"{}\"",
                         message,
@@ -584,6 +627,11 @@ where
                     component_linker: component::Linker::new(self.store.engine()),
                     store: Store::new(self.store.engine(), self.store.data().clone()),
                     modules: self.modules.clone(),
+                    async_runtime: self.async_runtime.as_ref().map(|_| {
+                        tokio::runtime::Builder::new_current_thread()
+                            .build()
+                            .unwrap()
+                    }),
                 };
                 let name = thread.name.name();
                 let child =
@@ -616,19 +664,23 @@ where
     }
 }
 
-fn is_matching_assert_invalid_error_message(expected: &str, actual: &str) -> bool {
-    actual.contains(expected)
-        // slight difference in error messages
-        || (expected.contains("unknown elem segment") && actual.contains("unknown element segment"))
-        || (expected.contains("type mismatch") && actual.contains("indirect calls must go through a table with type <= funcref"))
-        // The same test here is asserted to have one error message in
-        // `memory.wast` and a different error message in
-        // `memory64/memory.wast`, so we equate these two error messages to get
-        // the memory64 tests to pass.
-        || (expected.contains("memory size must be at most 65536 pages") && actual.contains("invalid u32 number"))
-        // the spec test suite asserts a different error message than we print
-        // for this scenario
-        || (expected == "unknown global" && actual.contains("global.get of locally defined global"))
-        || (expected == "immutable global" && actual.contains("global is immutable: cannot modify it with `global.set`"))
-        || (expected == "table size must be at most 2^32-1" && actual.contains("invalid u32 number: constant out of range"))
+fn is_matching_assert_invalid_error_message(test: &str, expected: &str, actual: &str) -> bool {
+    if actual.contains(expected) {
+        return true;
+    }
+
+    // Historically wasmtime/wasm-tools tried to match the upstream error
+    // message. This generally led to a large sequence of matches here which is
+    // not easy to maintain and is particularly difficult when test suites and
+    // proposals conflict with each other (e.g. one asserts one error message
+    // and another asserts a different error message). Overall we didn't benefit
+    // a whole lot from trying to match errors so just assume the error is
+    // roughly the same and otherwise don't try to match it.
+    if test.contains("spec_testsuite") {
+        return true;
+    }
+
+    // we are in control over all non-spec tests so all the error messages
+    // there should exactly match the `assert_invalid` or such
+    false
 }

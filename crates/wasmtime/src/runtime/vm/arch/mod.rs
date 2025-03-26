@@ -9,8 +9,8 @@
 
 cfg_if::cfg_if! {
     if #[cfg(target_arch = "x86_64")] {
-        mod x86_64;
-        use x86_64 as imp;
+        mod x86;
+        use x86 as imp;
     } else if #[cfg(target_arch = "aarch64")] {
         mod aarch64;
         use aarch64 as imp;

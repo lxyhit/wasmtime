@@ -3,6 +3,8 @@ use crate::component::types;
 use crate::component::InstanceExportLookup;
 use crate::prelude::*;
 use crate::runtime::vm::component::ComponentRuntimeInfo;
+#[cfg(feature = "std")]
+use crate::runtime::vm::open_file_for_mmap;
 use crate::runtime::vm::{
     CompiledModuleId, VMArrayCallFunction, VMFuncRef, VMFunctionBody, VMWasmCallFunction,
 };
@@ -13,7 +15,6 @@ use crate::{
 use crate::{FuncType, ValType};
 use alloc::sync::Arc;
 use core::any::Any;
-use core::mem;
 use core::ops::Range;
 use core::ptr::NonNull;
 #[cfg(feature = "std")]
@@ -23,6 +24,7 @@ use wasmtime_environ::component::{
     GlobalInitializer, InstantiateModule, NameMapNoIntern, StaticModuleIndex, TrampolineIndex,
     TypeComponentIndex, TypeDef, VMComponentOffsets,
 };
+use wasmtime_environ::TypeTrace;
 use wasmtime_environ::{FunctionLoc, HostPtr, ObjectKind, PrimaryMap};
 
 /// A compiled WebAssembly Component.
@@ -96,7 +98,7 @@ struct ComponentInner {
 
 pub(crate) struct AllCallFuncPointers {
     pub wasm_call: NonNull<VMWasmCallFunction>,
-    pub array_call: VMArrayCallFunction,
+    pub array_call: NonNull<VMArrayCallFunction>,
 }
 
 impl Component {
@@ -212,6 +214,23 @@ impl Component {
         Component::from_parts(engine, code, None)
     }
 
+    /// Same as [`Module::deserialize_raw`], but for components.
+    ///
+    /// See [`Component::deserialize`] for additional information; this method
+    /// works identically except that it will not create a copy of the provided
+    /// memory but will use it directly.
+    ///
+    /// # Unsafety
+    ///
+    /// All of the safety notes from [`Component::deserialize`] apply here as well
+    /// with the additional constraint that the code memory provide by `memory`
+    /// lives for as long as the module and is nevery externally modified for
+    /// the lifetime of the deserialized module.
+    pub unsafe fn deserialize_raw(engine: &Engine, memory: NonNull<[u8]>) -> Result<Component> {
+        let code = engine.load_code_raw(memory, ObjectKind::Component)?;
+        Component::from_parts(engine, code, None)
+    }
+
     /// Same as [`Module::deserialize_file`], but for components.
     ///
     /// Note that the file referenced here must contain contents previously
@@ -228,7 +247,10 @@ impl Component {
     /// [`Module::deserialize_file`]: crate::Module::deserialize_file
     #[cfg(feature = "std")]
     pub unsafe fn deserialize_file(engine: &Engine, path: impl AsRef<Path>) -> Result<Component> {
-        let code = engine.load_code_file(path.as_ref(), ObjectKind::Component)?;
+        let file = open_file_for_mmap(path.as_ref())?;
+        let code = engine
+            .load_code_file(file, ObjectKind::Component)
+            .with_context(|| format!("failed to load code for: {}", path.as_ref().display()))?;
         Component::from_parts(engine, code, None)
     }
 
@@ -380,11 +402,11 @@ impl Component {
         let ComponentArtifacts {
             ty,
             info,
-            types,
-            static_modules,
+            mut types,
+            mut static_modules,
         } = match artifacts {
             Some(artifacts) => artifacts,
-            None => postcard::from_bytes(code_memory.wasmtime_info()).err2anyhow()?,
+            None => postcard::from_bytes(code_memory.wasmtime_info())?,
         };
 
         // Validate that the component can be used with the current instance
@@ -398,7 +420,11 @@ impl Component {
         // Create a signature registration with the `Engine` for all trampolines
         // and core wasm types found within this component, both for the
         // component and for all included core wasm modules.
-        let signatures = TypeCollection::new_for_module(engine, types.module_types());
+        let signatures = engine.register_and_canonicalize_types(
+            types.module_types_mut(),
+            static_modules.iter_mut().map(|(_, m)| &mut m.module),
+        );
+        types.canonicalize_for_runtime_usage(&mut |idx| signatures.shared_type(idx).unwrap());
 
         // Assemble the `CodeObject` artifact which is shared by all core wasm
         // modules as well as the final component.
@@ -464,11 +490,7 @@ impl Component {
         } = &self.inner.info.trampolines[index];
         AllCallFuncPointers {
             wasm_call: self.func(wasm_call).cast(),
-            array_call: unsafe {
-                mem::transmute::<NonNull<VMFunctionBody>, VMArrayCallFunction>(
-                    self.func(array_call),
-                )
-            },
+            array_call: self.func(array_call).cast(),
         }
     }
 
@@ -516,7 +538,7 @@ impl Component {
             .info
             .resource_drop_wasm_to_array_trampoline
             .as_ref()
-            .map(|i| self.func(i).cast());
+            .map(|i| self.func(i).cast().into());
         VMFuncRef {
             wasm_call,
             ..*dtor.func_ref()
@@ -602,6 +624,7 @@ impl Component {
                 GlobalInitializer::LowerImport { .. }
                 | GlobalInitializer::ExtractMemory(_)
                 | GlobalInitializer::ExtractRealloc(_)
+                | GlobalInitializer::ExtractCallback(_)
                 | GlobalInitializer::ExtractPostReturn(_)
                 | GlobalInitializer::Resource(_) => {}
             }

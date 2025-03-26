@@ -266,6 +266,12 @@
 //!   with the same overhead as the `call-hook` feature where entries/exits into
 //!   WebAssembly will have more overhead than before.
 //!
+//! * `signals-based-traps` - Enabled by default, this enables support for using
+//!   host signal handlers to implement WebAssembly traps. For example virtual
+//!   memory is used to catch out-of-bounds accesses in WebAssembly that result
+//!   in segfaults. This is implicitly enabled by the `std` feature and is the
+//!   best way to get high-performance WebAssembly.
+//!
 //! More crate features can be found in the [manifest] of Wasmtime itself for
 //! seeing what can be enabled and disabled.
 //!
@@ -275,13 +281,19 @@
 #![doc(test(attr(deny(warnings))))]
 #![doc(test(attr(allow(dead_code, unused_variables, unused_mut))))]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
-#![cfg_attr(not(feature = "default"), allow(dead_code, unused_imports))]
+// NB: this list is currently being burned down to remove all features listed
+// here to get warnings in all configurations of Wasmtime.
+#![cfg_attr(
+    any(not(feature = "runtime"), not(feature = "std")),
+    allow(dead_code, unused_imports)
+)]
 // Allow broken links when the default features is disabled because most of our
 // documentation is written for the "one build" of the `main` branch which has
 // most features enabled. This will present warnings in stripped-down doc builds
 // and will prevent the doc build from failing.
 #![cfg_attr(feature = "default", warn(rustdoc::broken_intra_doc_links))]
 #![no_std]
+#![expect(clippy::allow_attributes_without_reason, reason = "crate not migrated")]
 
 #[cfg(any(feature = "std", unix, windows))]
 #[macro_use]
@@ -327,11 +339,11 @@ macro_rules! map_maybe_uninit {
                 use $crate::MaybeUninitExt;
 
                 let m: &mut core::mem::MaybeUninit<_> = $maybe_uninit;
-                // Note the usage of `addr_of_mut!` here which is an attempt to "stay
+                // Note the usage of `&raw` here which is an attempt to "stay
                 // safe" here where we never accidentally create `&mut T` where `T` is
                 // actually uninitialized, hopefully appeasing the Rust unsafe
                 // guidelines gods.
-                m.map(|p| core::ptr::addr_of_mut!((*p)$($field)*))
+                m.map(|p| &raw mut (*p)$($field)*)
             }
         }
     })

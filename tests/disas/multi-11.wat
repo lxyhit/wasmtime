@@ -11,13 +11,13 @@
 ;; function u0:0(i64 vmctx, i64, i64) -> i64, i64 tail {
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly gv0+8
-;;     gv2 = load.i64 notrap aligned gv1
+;;     gv2 = load.i64 notrap aligned gv1+16
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64, v2: i64):
-;; @002b                               jump block2(v2)
+;; @002b                               jump block2
 ;;
-;;                                 block2(v5: i64):
+;;                                 block2:
 ;; @002d                               v8 = iconst.i64 42
-;; @002f                               return v5, v8  ; v8 = 42
+;; @002f                               return v2, v8  ; v8 = 42
 ;; }

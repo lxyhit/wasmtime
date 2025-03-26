@@ -4,9 +4,8 @@ use std::sync::{Condvar, LazyLock, Mutex};
 use wasmtime::{
     Config, Engine, InstanceAllocationStrategy, MpkEnabled, PoolingAllocationConfig, Store,
 };
-use wasmtime_environ::Memory;
-use wasmtime_wast::{SpectestConfig, WastContext};
-use wasmtime_wast_util::{limits, Collector, Compiler, WastConfig, WastTest};
+use wasmtime_test_util::wast::{limits, Collector, Compiler, WastConfig, WastTest};
+use wasmtime_wast::{Async, SpectestConfig, WastContext};
 
 fn main() {
     env_logger::init();
@@ -14,7 +13,7 @@ fn main() {
     let tests = if cfg!(miri) {
         Vec::new()
     } else {
-        wasmtime_wast_util::find_tests(".".as_ref()).unwrap()
+        wasmtime_test_util::wast::find_tests(".".as_ref()).unwrap()
     };
 
     let mut trials = Vec::new();
@@ -23,7 +22,16 @@ fn main() {
     // run this test in.
     for test in tests {
         let test_uses_gc_types = test.test_uses_gc_types();
-        for compiler in [Compiler::Cranelift, Compiler::Winch] {
+        for compiler in [
+            Compiler::CraneliftNative,
+            Compiler::Winch,
+            Compiler::CraneliftPulley,
+        ] {
+            // Skip compilers that have no support for this host.
+            if !compiler.supports_host() {
+                continue;
+            }
+
             for pooling in [true, false] {
                 let collectors: &[_] = if !pooling && test_uses_gc_types {
                     &[Collector::DeferredReferenceCounting, Collector::Null]
@@ -105,65 +113,19 @@ fn run_wast(test: &WastTest, config: WastConfig) -> anyhow::Result<()> {
     // `crates/wast-util/src/lib.rs` file.
     let should_fail = test.should_fail(&config);
 
-    // Note that all of these proposals/features are currently default-off to
-    // ensure that we annotate all tests accurately with what features they
-    // need, even in the future when features are stabilized.
-    let memory64 = test_config.memory64.unwrap_or(false);
-    let custom_page_sizes = test_config.custom_page_sizes.unwrap_or(false);
-    let multi_memory = test_config.multi_memory.unwrap_or(false);
-    let threads = test_config.threads.unwrap_or(false);
-    let gc = test_config.gc.unwrap_or(false);
-    let tail_call = test_config.tail_call.unwrap_or(false);
-    let extended_const = test_config.extended_const.unwrap_or(false);
-    let wide_arithmetic = test_config.wide_arithmetic.unwrap_or(false);
-    let test_hogs_memory = test_config.hogs_memory.unwrap_or(false);
-    let component_model_more_flags = test_config.component_model_more_flags.unwrap_or(false);
-    let nan_canonicalization = test_config.nan_canonicalization.unwrap_or(false);
-    let relaxed_simd = test_config.relaxed_simd.unwrap_or(false);
-
-    // Some proposals in wasm depend on previous proposals. For example the gc
-    // proposal depends on function-references which depends on reference-types.
-    // To avoid needing to enable all of them at once implicitly enable
-    // downstream proposals once the end proposal is enabled (e.g. when enabling
-    // gc that also enables function-references and reference-types).
-    let function_references = test_config
-        .function_references
-        .or(test_config.gc)
-        .unwrap_or(false);
-    let reference_types = test_config
-        .reference_types
-        .or(test_config.function_references)
-        .or(test_config.gc)
-        .unwrap_or(false);
+    let multi_memory = test_config.multi_memory();
+    let test_hogs_memory = test_config.hogs_memory();
+    let relaxed_simd = test_config.relaxed_simd();
 
     let is_cranelift = match config.compiler {
-        Compiler::Cranelift => true,
+        Compiler::CraneliftNative | Compiler::CraneliftPulley => true,
         _ => false,
     };
 
     let mut cfg = Config::new();
-    cfg.wasm_multi_memory(multi_memory)
-        .wasm_threads(threads)
-        .wasm_memory64(memory64)
-        .wasm_function_references(function_references)
-        .wasm_gc(gc)
-        .wasm_reference_types(reference_types)
-        .wasm_relaxed_simd(relaxed_simd)
-        .wasm_tail_call(tail_call)
-        .wasm_custom_page_sizes(custom_page_sizes)
-        .wasm_extended_const(extended_const)
-        .wasm_wide_arithmetic(wide_arithmetic)
-        .wasm_component_model_more_flags(component_model_more_flags)
-        .strategy(match config.compiler {
-            Compiler::Cranelift => wasmtime::Strategy::Cranelift,
-            Compiler::Winch => wasmtime::Strategy::Winch,
-        })
-        .collector(match config.collector {
-            Collector::Auto => wasmtime::Collector::Auto,
-            Collector::Null => wasmtime::Collector::Null,
-            Collector::DeferredReferenceCounting => wasmtime::Collector::DeferredReferenceCounting,
-        })
-        .cranelift_nan_canonicalization(nan_canonicalization);
+    cfg.async_support(true);
+    wasmtime_test_util::wasmtime_wast::apply_test_config(&mut cfg, &test_config);
+    wasmtime_test_util::wasmtime_wast::apply_wast_config(&mut cfg, &config);
 
     if is_cranelift {
         cfg.cranelift_debug_verifier(true);
@@ -178,7 +140,11 @@ fn run_wast(test: &WastTest, config: WastConfig) -> anyhow::Result<()> {
     // Locally testing this out this drops QEMU's memory usage running this
     // tests suite from 10GiB to 600MiB. Previously we saw that crossing the
     // 10GiB threshold caused our processes to get OOM killed on CI.
-    if std::env::var("WASMTIME_TEST_NO_HOG_MEMORY").is_ok() {
+    //
+    // Note that this branch is also taken for 32-bit platforms which generally
+    // can't test much of the pooling allocator as the virtual address space is
+    // so limited.
+    if cfg!(target_pointer_width = "32") || std::env::var("WASMTIME_TEST_NO_HOG_MEMORY").is_ok() {
         // The pooling allocator hogs ~6TB of virtual address space for each
         // store, so if we don't to hog memory then ignore pooling tests.
         if config.pooling {
@@ -194,7 +160,7 @@ fn run_wast(test: &WastTest, config: WastConfig) -> anyhow::Result<()> {
         // Don't use 4gb address space reservations when not hogging memory, and
         // also don't reserve lots of memory after dynamic memories for growth
         // (makes growth slower).
-        cfg.memory_reservation(2 * u64::from(Memory::DEFAULT_PAGE_SIZE));
+        cfg.memory_reservation(2 * u64::from(wasmtime_environ::Memory::DEFAULT_PAGE_SIZE));
         cfg.memory_reservation_for_growth(0);
 
         let small_guard = 64 * 1024;
@@ -264,7 +230,7 @@ fn run_wast(test: &WastTest, config: WastConfig) -> anyhow::Result<()> {
     for (engine, desc) in engines {
         let result = engine.and_then(|engine| {
             let store = Store::new(&engine, ());
-            let mut wast_context = WastContext::new(store);
+            let mut wast_context = WastContext::new(store, Async::Yes);
             wast_context.register_spectest(&SpectestConfig {
                 use_shared_memory: true,
                 suppress_prints: true,

@@ -180,7 +180,7 @@ pub mod foo {
         #[allow(clippy::all)]
         pub mod wasi_filesystem {
             #[allow(unused_imports)]
-            use wasmtime::component::__internal::anyhow;
+            use wasmtime::component::__internal::{anyhow, Box};
             #[derive(wasmtime::component::ComponentType)]
             #[derive(wasmtime::component::Lift)]
             #[derive(wasmtime::component::Lower)]
@@ -237,31 +237,35 @@ pub mod foo {
                     write!(f, "{} (error {})", self.name(), * self as i32)
                 }
             }
-            impl std::error::Error for Errno {}
+            impl core::error::Error for Errno {}
             const _: () = {
                 assert!(1 == < Errno as wasmtime::component::ComponentType >::SIZE32);
                 assert!(1 == < Errno as wasmtime::component::ComponentType >::ALIGN32);
             };
-            #[wasmtime::component::__internal::async_trait]
+            #[wasmtime::component::__internal::trait_variant_make(::core::marker::Send)]
             pub trait Host: Send {
                 async fn create_directory_at(&mut self) -> Result<(), Errno>;
                 async fn stat(&mut self) -> Result<DescriptorStat, Errno>;
             }
             pub trait GetHost<
                 T,
-            >: Fn(T) -> <Self as GetHost<T>>::Host + Send + Sync + Copy + 'static {
+                D,
+            >: Fn(T) -> <Self as GetHost<T, D>>::Host + Send + Sync + Copy + 'static {
                 type Host: Host + Send;
             }
-            impl<F, T, O> GetHost<T> for F
+            impl<F, T, D, O> GetHost<T, D> for F
             where
                 F: Fn(T) -> O + Send + Sync + Copy + 'static,
                 O: Host + Send,
             {
                 type Host = O;
             }
-            pub fn add_to_linker_get_host<T>(
+            pub fn add_to_linker_get_host<
+                T,
+                G: for<'a> GetHost<&'a mut T, T, Host: Host + Send>,
+            >(
                 linker: &mut wasmtime::component::Linker<T>,
-                host_getter: impl for<'a> GetHost<&'a mut T>,
+                host_getter: G,
             ) -> wasmtime::Result<()>
             where
                 T: Send,
@@ -325,7 +329,6 @@ pub mod foo {
             {
                 add_to_linker_get_host(linker, get)
             }
-            #[wasmtime::component::__internal::async_trait]
             impl<_T: Host + ?Sized + Send> Host for &mut _T {
                 async fn create_directory_at(&mut self) -> Result<(), Errno> {
                     Host::create_directory_at(*self).await
@@ -338,24 +341,47 @@ pub mod foo {
         #[allow(clippy::all)]
         pub mod wall_clock {
             #[allow(unused_imports)]
-            use wasmtime::component::__internal::anyhow;
-            #[wasmtime::component::__internal::async_trait]
+            use wasmtime::component::__internal::{anyhow, Box};
+            #[derive(wasmtime::component::ComponentType)]
+            #[derive(wasmtime::component::Lift)]
+            #[derive(wasmtime::component::Lower)]
+            #[component(record)]
+            #[derive(Clone, Copy)]
+            pub struct WallClock {}
+            impl core::fmt::Debug for WallClock {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.debug_struct("WallClock").finish()
+                }
+            }
+            const _: () = {
+                assert!(
+                    0 == < WallClock as wasmtime::component::ComponentType >::SIZE32
+                );
+                assert!(
+                    1 == < WallClock as wasmtime::component::ComponentType >::ALIGN32
+                );
+            };
+            #[wasmtime::component::__internal::trait_variant_make(::core::marker::Send)]
             pub trait Host: Send {}
             pub trait GetHost<
                 T,
-            >: Fn(T) -> <Self as GetHost<T>>::Host + Send + Sync + Copy + 'static {
+                D,
+            >: Fn(T) -> <Self as GetHost<T, D>>::Host + Send + Sync + Copy + 'static {
                 type Host: Host + Send;
             }
-            impl<F, T, O> GetHost<T> for F
+            impl<F, T, D, O> GetHost<T, D> for F
             where
                 F: Fn(T) -> O + Send + Sync + Copy + 'static,
                 O: Host + Send,
             {
                 type Host = O;
             }
-            pub fn add_to_linker_get_host<T>(
+            pub fn add_to_linker_get_host<
+                T,
+                G: for<'a> GetHost<&'a mut T, T, Host: Host + Send>,
+            >(
                 linker: &mut wasmtime::component::Linker<T>,
-                host_getter: impl for<'a> GetHost<&'a mut T>,
+                host_getter: G,
             ) -> wasmtime::Result<()>
             where
                 T: Send,
@@ -373,7 +399,6 @@ pub mod foo {
             {
                 add_to_linker_get_host(linker, get)
             }
-            #[wasmtime::component::__internal::async_trait]
             impl<_T: Host + ?Sized + Send> Host for &mut _T {}
         }
     }

@@ -220,7 +220,13 @@ pub fn mem_emit(
         &MemArg::Symbol {
             ref name, offset, ..
         } => {
-            sink.add_reloc_at_offset(2, Reloc::S390xPCRel32Dbl, &**name, (offset + 2).into());
+            let reloc_offset = sink.cur_offset() + 2;
+            sink.add_reloc_at_offset(
+                reloc_offset,
+                Reloc::S390xPCRel32Dbl,
+                &**name,
+                (offset + 2).into(),
+            );
             put(sink, &enc_ril_b(opcode_ril.unwrap(), rd, 0));
         }
         _ => unreachable!(),
@@ -1996,21 +2002,21 @@ impl Inst {
                     match &inst {
                         // Replace a CondBreak with a branch to done_label.
                         &Inst::CondBreak { cond } => {
-                            let inst = Inst::OneWayCondBr {
-                                target: done_label,
-                                cond: *cond,
-                            };
-                            inst.emit_with_alloc_consumer(sink, emit_info, state);
+                            let opcode = 0xc04; // BCRL
+                            sink.use_label_at_offset(
+                                sink.cur_offset(),
+                                done_label,
+                                LabelUse::BranchRIL,
+                            );
+                            put(sink, &enc_ril_c(opcode, cond.bits(), 0));
                         }
                         _ => inst.emit_with_alloc_consumer(sink, emit_info, state),
                     };
                 }
 
-                let inst = Inst::OneWayCondBr {
-                    target: loop_label,
-                    cond,
-                };
-                inst.emit(sink, emit_info, state);
+                let opcode = 0xc04; // BCRL
+                sink.use_label_at_offset(sink.cur_offset(), loop_label, LabelUse::BranchRIL);
+                put(sink, &enc_ril_c(opcode, cond.bits(), 0));
 
                 // Emit label at the end of the loop.
                 sink.bind_label(done_label, &mut state.ctrl_plane);
@@ -3198,7 +3204,8 @@ impl Inst {
                 // Add relocation for target function.  This has to be done *before*
                 // the S390xTlsGdCall relocation if any, to ensure linker relaxation
                 // works correctly.
-                sink.add_reloc_at_offset(2, Reloc::S390xPLTRel32Dbl, &info.dest, 2);
+                let offset = sink.cur_offset() + 2;
+                sink.add_reloc_at_offset(offset, Reloc::S390xPLTRel32Dbl, &info.dest, 2);
 
                 if let Some(s) = state.take_stack_map() {
                     let offset = sink.cur_offset() + 6;
@@ -3232,7 +3239,8 @@ impl Inst {
                 }
 
                 let opcode = 0xc04; // BCRL
-                sink.add_reloc_at_offset(2, Reloc::S390xPLTRel32Dbl, &info.dest, 2);
+                let offset = sink.cur_offset() + 2;
+                sink.add_reloc_at_offset(offset, Reloc::S390xPLTRel32Dbl, &info.dest, 2);
                 put(sink, &enc_ril_c(opcode, 15, 0));
                 sink.add_call_site();
             }
@@ -3257,7 +3265,8 @@ impl Inst {
                 // *before* the S390xTlsGdCall, to ensure linker relaxation
                 // works correctly.
                 let dest = ExternalName::LibCall(LibCall::ElfTlsGetOffset);
-                sink.add_reloc_at_offset(2, Reloc::S390xPLTRel32Dbl, &dest, 2);
+                let offset = sink.cur_offset() + 2;
+                sink.add_reloc_at_offset(offset, Reloc::S390xPLTRel32Dbl, &dest, 2);
                 match &**symbol {
                     SymbolReloc::TlsGd { name } => sink.add_reloc(Reloc::S390xTlsGdCall, name, 0),
                     _ => unreachable!(),
@@ -3305,11 +3314,6 @@ impl Inst {
                 sink.add_uncond_branch(uncond_off, uncond_off + 6, not_taken);
                 put(sink, &enc_ril_c(opcode, 15, 0));
             }
-            &Inst::OneWayCondBr { target, cond } => {
-                let opcode = 0xc04; // BCRL
-                sink.use_label_at_offset(sink.cur_offset(), target, LabelUse::BranchRIL);
-                put(sink, &enc_ril_c(opcode, cond.bits(), 0));
-            }
             &Inst::Nop0 => {}
             &Inst::Nop2 => {
                 put(sink, &enc_e(0x0707));
@@ -3332,12 +3336,22 @@ impl Inst {
                 put_with_trap(sink, &enc[0..4], trap_code);
                 put(sink, &enc[4..6]);
             }
-            &Inst::JTSequence { ridx, ref targets } => {
+            &Inst::JTSequence {
+                ridx,
+                default,
+                default_cond,
+                ref targets,
+            } => {
                 let table_label = sink.get_label();
 
                 // This sequence is *one* instruction in the vcode, and is expanded only here at
                 // emission time, because we cannot allow the regalloc to insert spills/reloads in
                 // the middle; we depend on hardcoded PC-rel addressing below.
+
+                // Branch to the default target if the given default condition is true.
+                let opcode = 0xc04; // BCRL
+                sink.use_label_at_offset(sink.cur_offset(), default, LabelUse::BranchRIL);
+                put(sink, &enc_ril_c(opcode, default_cond.bits(), 0));
 
                 // Set temp register to address of jump table.
                 let rtmp = writable_spilltmp_reg();

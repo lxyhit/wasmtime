@@ -8,6 +8,7 @@ use crate::runtime::vm::table::Table;
 use crate::runtime::vm::{CompiledModuleId, ModuleRuntimeInfo, VMFuncRef, VMGcRef, VMStore};
 use crate::store::{AutoAssertNoGc, StoreOpaque};
 use crate::vm::VMGlobalDefinition;
+use core::ptr::NonNull;
 use core::{any::Any, mem, ptr};
 use wasmtime_environ::{
     DefinedMemoryIndex, DefinedTableIndex, HostPtr, InitMemory, MemoryInitialization,
@@ -73,6 +74,13 @@ pub struct InstanceAllocationRequest<'a> {
 
     /// Request that the instance's memories be protected by a specific
     /// protection key.
+    #[cfg_attr(
+        not(feature = "pooling-allocator"),
+        expect(
+            dead_code,
+            reason = "easier to keep this field than remove it, not perf-critical to remove"
+        )
+    )]
     pub pkey: Option<ProtectionKey>,
 
     /// Tunable configuration options the engine is using.
@@ -84,7 +92,7 @@ pub struct InstanceAllocationRequest<'a> {
 /// InstanceAllocationRequest, rather than on a &mut InstanceAllocationRequest
 /// itself, because several use-sites require a split mut borrow on the
 /// InstanceAllocationRequest.
-pub struct StorePtr(Option<*mut dyn VMStore>);
+pub struct StorePtr(Option<NonNull<dyn VMStore>>);
 
 impl StorePtr {
     /// A pointer to no Store.
@@ -93,12 +101,12 @@ impl StorePtr {
     }
 
     /// A pointer to a Store.
-    pub fn new(ptr: *mut dyn VMStore) -> Self {
+    pub fn new(ptr: NonNull<dyn VMStore>) -> Self {
         Self(Some(ptr))
     }
 
     /// The raw contents of this struct
-    pub fn as_raw(&self) -> Option<*mut dyn VMStore> {
+    pub fn as_raw(&self) -> Option<NonNull<dyn VMStore>> {
         self.0
     }
 
@@ -106,10 +114,8 @@ impl StorePtr {
     ///
     /// Safety: must not be used outside the original lifetime of the borrow.
     pub(crate) unsafe fn get(&mut self) -> Option<&mut dyn VMStore> {
-        match self.0 {
-            Some(ptr) => Some(&mut *ptr),
-            None => None,
-        }
+        let ptr = self.0?.as_mut();
+        Some(ptr)
     }
 }
 
@@ -127,6 +133,7 @@ impl Default for MemoryAllocationIndex {
 
 impl MemoryAllocationIndex {
     /// Get the underlying index of this `MemoryAllocationIndex`.
+    #[cfg(feature = "pooling-allocator")]
     pub fn index(&self) -> usize {
         self.0 as usize
     }
@@ -146,6 +153,7 @@ impl Default for TableAllocationIndex {
 
 impl TableAllocationIndex {
     /// Get the underlying index of this `TableAllocationIndex`.
+    #[cfg(feature = "pooling-allocator")]
     pub fn index(&self) -> usize {
         self.0 as usize
     }
@@ -304,6 +312,7 @@ pub unsafe trait InstanceAllocatorImpl {
     #[cfg(feature = "gc")]
     fn allocate_gc_heap(
         &self,
+        engine: &crate::Engine,
         gc_runtime: &dyn GcRuntime,
     ) -> Result<(GcHeapAllocationIndex, Box<dyn GcHeap>)>;
 
@@ -582,7 +591,7 @@ fn initialize_tables(
                         let gc_store = store.gc_store_mut()?;
                         let items = (0..table.size())
                             .map(|_| gc_ref.as_ref().map(|r| gc_store.clone_gc_ref(r)));
-                        table.init_gc_refs(0, items).err2anyhow()?;
+                        table.init_gc_refs(0, items)?;
                     }
 
                     WasmHeapTopType::Any => {
@@ -590,14 +599,16 @@ fn initialize_tables(
                         let gc_store = store.gc_store_mut()?;
                         let items = (0..table.size())
                             .map(|_| gc_ref.as_ref().map(|r| gc_store.clone_gc_ref(r)));
-                        table.init_gc_refs(0, items).err2anyhow()?;
+                        table.init_gc_refs(0, items)?;
                     }
 
                     WasmHeapTopType::Func => {
-                        let funcref = raw.get_funcref().cast::<VMFuncRef>();
+                        let funcref = NonNull::new(raw.get_funcref().cast::<VMFuncRef>());
                         let items = (0..table.size()).map(|_| funcref);
-                        table.init_func(0, items).err2anyhow()?;
+                        table.init_func(0, items)?;
                     }
+
+                    WasmHeapTopType::Cont => todo!(), // FIXME: #10248 stack switching support.
                 }
             }
         }
@@ -616,18 +627,15 @@ fn initialize_tables(
                 .eval(store, context, &segment.offset)
                 .expect("const expression should be valid")
         };
-        context
-            .instance
-            .table_init_segment(
-                store,
-                const_evaluator,
-                segment.table_index,
-                &segment.elements,
-                start.get_u64(),
-                0,
-                segment.elements.len(),
-            )
-            .err2anyhow()?;
+        context.instance.table_init_segment(
+            store,
+            const_evaluator,
+            segment.table_index,
+            &segment.elements,
+            start.get_u64(),
+            0,
+            segment.elements.len(),
+        )?;
     }
 
     Ok(())
@@ -739,7 +747,7 @@ fn initialize_memories(
             unsafe {
                 let src = self.context.instance.wasm_data(init.data.clone());
                 let offset = usize::try_from(init.offset).unwrap();
-                let dst = memory.base.add(offset);
+                let dst = memory.base.as_ptr().add(offset);
 
                 assert!(offset + src.len() <= memory.current_length());
 
@@ -761,7 +769,7 @@ fn initialize_memories(
             const_evaluator,
         });
     if !ok {
-        return Err(Trap::MemoryOutOfBounds).err2anyhow();
+        return Err(Trap::MemoryOutOfBounds.into());
     }
 
     Ok(())
@@ -806,7 +814,7 @@ fn initialize_globals(
         let wasm_ty = module.globals[module.global_index(index)].wasm_ty;
 
         #[cfg(feature = "wmemcheck")]
-        if index.as_bits() == 0 && wasm_ty == wasmtime_environ::WasmValType::I32 {
+        if index.as_u32() == 0 && wasm_ty == wasmtime_environ::WasmValType::I32 {
             if let Some(wmemcheck) = &mut context.instance.wmemcheck_state {
                 let size = usize::try_from(raw.get_i32()).unwrap();
                 wmemcheck.set_stack_size(size);
@@ -816,10 +824,7 @@ fn initialize_globals(
         // This write is safe because we know we have the correct module for
         // this instance and its vmctx due to the assert above.
         unsafe {
-            ptr::write(
-                to,
-                VMGlobalDefinition::from_val_raw(&mut store, wasm_ty, raw)?,
-            )
+            to.write(VMGlobalDefinition::from_val_raw(&mut store, wasm_ty, raw)?);
         };
     }
     Ok(())
