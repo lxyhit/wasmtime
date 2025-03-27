@@ -22,8 +22,6 @@ use std::hash::Hash;
 use thiserror::Error;
 use wiggle::{GuestError, GuestMemory, GuestPtr};
 
-pub use generated::wasi_ephemeral_nn::add_to_linker;
-
 pub(crate) type WasiNnResult<T> = std::result::Result<T, WasiNnError>;
 type Result<T> = WasiNnResult<T>;
 type GraphId = u32;
