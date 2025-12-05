@@ -34,6 +34,7 @@ thiserror = { workspace = true }
 ort = { git = "https://github.com/lxyhit/ort.git", branch = "v2.0.0-rc.2", default-features = false, features = [
     "load-dynamic",
     "half",
+    "cuda"
 ], optional = true }
 tch = { version = "0.17.0", default-features = false, optional = true }
 

@@ -5,7 +5,7 @@ use crate::backend::{read, Id};
 use crate::wit::types::{ExecutionTarget, GraphEncoding, Tensor, TensorType};
 use crate::{ExecutionContext, Graph};
 use anyhow::Context;
-use ort::{inputs, GraphOptimizationLevel, Session};
+use ort::{inputs, GraphOptimizationLevel, Session, CUDAExecutionProvider};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
