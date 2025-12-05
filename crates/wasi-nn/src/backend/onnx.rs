@@ -25,6 +25,7 @@ impl BackendInner for OnnxBackend {
         }
 
         let session = Session::builder()?
+            .with_execution_providers([CUDAExecutionProvider::default().build()])?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .commit_from_memory(builders[0])?;
 
